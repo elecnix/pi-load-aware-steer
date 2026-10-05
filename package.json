@@ -1,0 +1,33 @@
+{
+  "name": "load-aware-steer",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "license": "MIT",
+  "description": "Pi extension that reports system load and memory usage in the conversation when either changes band",
+  "keywords": [
+    "pi",
+    "pi-extension",
+    "load-average",
+    "memory",
+    "monitoring"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/elecnix/pi-load-aware-steer.git"
+  },
+  "scripts": {
+    "check": "tsc --noEmit",
+    "test": "node --test test/signals.test.ts test/load.test.ts test/memory.test.ts test/extension.test.ts"
+  },
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "0.85.1",
+    "@types/node": "^22.0.0",
+    "typescript": "^5.9.0"
+  }
+}
