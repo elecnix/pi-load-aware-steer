@@ -22,8 +22,6 @@ export type SteerConfig = BandConfig & {
 	loadThreshold: number;
 	/** Fraction of installed RAM in use at which the `elevated` band engages, 0-1. */
 	memoryThreshold: number;
-	/** How often to sample, in milliseconds. */
-	intervalMs: number;
 	/** Master switch. When false the extension samples and shows a status line but announces nothing. */
 	enabled: boolean;
 	loadThresholdSource: ThresholdSource;
@@ -50,7 +48,6 @@ export const DEFAULTS = {
 	loadThreshold: cpuCount(),
 	/** 80% of installed RAM. */
 	memoryThresholdPercent: 80,
-	intervalMs: 15_000,
 	enabled: true,
 } as const;
 
@@ -134,11 +131,6 @@ export async function loadConfig(options: LoadConfigOptions = {}): Promise<Steer
 		warnings.push(`hysteresis ${hysteresis} outside [0, 1); using default ${DEFAULT_BAND_CONFIG.hysteresis}`);
 	}
 
-	const interval = numberFrom(env.LOAD_AWARE_STEER_INTERVAL_MS) ?? fileNumber("intervalMs") ?? DEFAULTS.intervalMs;
-	if (interval < 250) {
-		warnings.push(`intervalMs ${interval} below 250ms minimum; clamping`);
-	}
-
 	const enabled = boolFrom(env.LOAD_AWARE_STEER_ENABLED) ?? fileBool("enabled") ?? DEFAULTS.enabled;
 
 	return {
@@ -146,7 +138,6 @@ export async function loadConfig(options: LoadConfigOptions = {}): Promise<Steer
 		loadThresholdSource,
 		memoryThreshold,
 		memoryThresholdSource,
-		intervalMs: Math.max(250, interval),
 		enabled,
 		warnings,
 		elevatedMultiplier: DEFAULT_BAND_CONFIG.elevatedMultiplier,
