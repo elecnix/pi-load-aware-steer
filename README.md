@@ -73,7 +73,7 @@ With `enabled: false` the extension still samples at the boundaries and still up
 ## Limitations
 
 - Each pi session monitors itself. There is no shared state between sessions, so several sessions on one machine each report independently and none of them sees the others. A fleet-wide view would need an IPC layer this extension does not have.
-- Memory figures come from `os.totalmem()` and `os.freemem()`. On macOS, `freemem` counts reclaimable page cache as free, so used memory can read low on a machine with a warm cache. That is a platform property, and it is why the memory threshold is configurable.
+- Memory figures follow each platform's own accounting of memory in use, because `os.freemem()` on its own counts reclaimable page cache as in use and reports near-saturation on a machine with a warm cache. On macOS the reader parses `vm_stat` and adds anonymous, wired and compressed pages, which is the total Activity Monitor shows. On Linux it reads `/proc/meminfo` and subtracts `MemAvailable` from `MemTotal`. Everywhere else, and whenever either source fails, it falls back to `os.totalmem() - os.freemem()`. The `source` field on a sample records which path produced the number, and `LOAD_AWARE_STEER_DEBUG=1` logs a fallback to stderr.
 - Load average counts runnable and uninterruptible threads, so heavy disk I/O raises it even when the CPUs are idle.
 - A value oscillating across a band boundary produces one message per crossing. Raise `hysteresis` to reduce the rate.
 - `os.loadavg()` is absent on Windows, where it returns zeros. The extension reports the load as unavailable rather than treating a zero reading as an idle machine, and a footer status shows `—` for it.

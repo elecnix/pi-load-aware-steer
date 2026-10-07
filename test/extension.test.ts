@@ -41,14 +41,14 @@ function unavailableLoad(): LoadSample {
 	return { available: false, load1: 0, load5: 0, load15: 0, source: "unavailable", detail: "test: no sensor" };
 }
 
-function memorySample(fraction: number): MemorySample {
+function memorySample(fraction: number, source: MemorySample["source"] = "node:os"): MemorySample {
 	const totalBytes = 32 * GIB;
 	return {
 		available: true,
 		totalBytes,
 		usedBytes: Math.round(totalBytes * fraction),
 		usedFraction: fraction,
-		source: "node:os",
+		source,
 	};
 }
 
@@ -79,7 +79,7 @@ function makeHarness(config: SteerConfig) {
 	const handlers = new Map<string, Handler>();
 
 	// The test drives the machine by writing to this object.
-	const box = { load1: 0.5, loadAvailable: true, memory: 0.3 };
+	const box = { load1: 0.5, loadAvailable: true, memory: 0.3, memorySource: "node:os" as MemorySample["source"] };
 	const calls = { load: 0, memory: 0 };
 
 	const deps: SteerDeps = {
@@ -89,7 +89,7 @@ function makeHarness(config: SteerConfig) {
 		},
 		readMemoryImpl: async () => {
 			calls.memory++;
-			return memorySample(box.memory);
+			return memorySample(box.memory, box.memorySource);
 		},
 		loadConfigImpl: async () => config,
 		cpuCountImpl: () => 10,
@@ -258,6 +258,27 @@ test("a message reports load, CPU count, and memory used of total", async () => 
 	assert.match(text, /10 logical CPUs/, "reports the CPU count");
 	assert.match(text, /16\.0 GiB of 32\.0 GiB in use \(50%\)/, "reports memory used of total");
 	assert.match(text, /Memory:.*band normal\./, "an unchanged signal shows its current band");
+	await h.stop();
+});
+
+test("a memory sample from vm_stat reports the same figures as one from os.freemem", async () => {
+	const h = makeHarness(testConfig());
+	await h.start();
+
+	h.box.load1 = 0.5;
+	h.box.memory = 0.9;
+	h.box.memorySource = "node:os";
+	const naive = (await h.prompt())?.message?.content ?? "";
+
+	h.box.memory = 0.4;
+	h.box.memorySource = "vm_stat";
+	const accurate = (await h.prompt())?.message?.content ?? "";
+
+	// The source changes the number, not the shape of the report: the reader
+	// sees the same sentence with the figures the sampler produced.
+	assert.match(naive, /28\.8 GiB of 32\.0 GiB in use \(90%\)/, "the naive sample reports its own figure");
+	assert.match(accurate, /12\.8 GiB of 32\.0 GiB in use \(40%\)/, "the vm_stat sample reports its own figure");
+	assert.match(accurate, /Memory:.*Band elevated -> normal\./, "the band steps down as the figure falls");
 	await h.stop();
 });
 
