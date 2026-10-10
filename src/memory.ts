@@ -29,6 +29,10 @@ import { readFile } from "node:fs/promises";
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 
+// The byte formatter lives in format.ts so swap.ts can share it; re-exported
+// here because it was part of this module's surface first.
+export { formatBytes } from "./format.ts";
+
 const execFileAsync = promisify(execFile);
 
 export type MemorySource = "vm_stat" | "/proc/meminfo" | "node:os" | "unavailable";
@@ -57,8 +61,6 @@ export type MemoryReaderOptions = {
 	/** Injected for tests. Returns stdout. Defaults to execFile("vm_stat"). */
 	execFileImpl?: (file: string, args: string[]) => Promise<string>;
 };
-
-const BYTES_PER_GIB = 1024 ** 3;
 
 /** Clamp to [0, total] so rounding and cgroup accounting cannot produce a
  *  negative or over-total used figure. */
@@ -209,13 +211,4 @@ export async function readMemory(options: MemoryReaderOptions = {}): Promise<Mem
 	// rounding at the boundary can push it one byte over. Clamp rather than
 	// report a negative used-bytes figure.
 	return sample(total, total - free, "node:os");
-}
-
-/** Human-readable byte count, binary units. */
-export function formatBytes(bytes: number): string {
-	if (!Number.isFinite(bytes) || bytes < 0) return "unknown";
-	if (bytes >= BYTES_PER_GIB) return `${(bytes / BYTES_PER_GIB).toFixed(1)} GiB`;
-	if (bytes >= 1024 ** 2) return `${(bytes / 1024 ** 2).toFixed(0)} MiB`;
-	if (bytes >= 1024) return `${(bytes / 1024).toFixed(0)} KiB`;
-	return `${bytes} B`;
 }

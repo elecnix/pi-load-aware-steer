@@ -1,13 +1,13 @@
 /**
  * load-aware-steer
  *
- * Watches two signals on this machine — 1-minute load average and physical
- * memory in use — and puts a number in the conversation when one of them
- * changes band.
+ * Watches four signals on this machine — 1-minute load average, physical
+ * memory in use, swap in use, and the share of wall time stalled on disk I/O —
+ * and puts a number in the conversation when one of them changes band.
  *
  * It reports. It does not steer. There is no system-prompt nudge, no tool
  * block, no command deferral, and no registered command. The only thing this
- * extension ever does is sample two numbers, keep a status line current, and
+ * extension ever does is sample four numbers, keep a status line current, and
  * append a factual message to the conversation when a band changes.
  *
  * Sampling happens at two turn boundaries and nowhere else: when a user
@@ -36,26 +36,35 @@ import type {
 } from "@earendil-works/pi-coding-agent";
 
 import { readLoad, type LoadSample } from "./src/load.ts";
-import { readMemory, formatBytes, type MemorySample } from "./src/memory.ts";
+import { readMemory, type MemorySample } from "./src/memory.ts";
+import { readSwap, type SwapSample } from "./src/swap.ts";
+import { readIoPressure, type IoPressureSample } from "./src/io.ts";
+import { formatBytes } from "./src/format.ts";
 import { nextBand, isCrossing, type Band } from "./src/signals.ts";
 import { loadConfig, cpuCount, type SteerConfig } from "./src/config.ts";
 
 const STATUS_KEY = "load-aware-steer";
 const MESSAGE_TYPE = "load-aware-steer.update";
 
-/** Identifies which of the two signals a band belongs to. */
-type Signal = "load" | "memory";
+/** Identifies which of the watched signals a band belongs to. */
+type Signal = "load" | "memory" | "swap" | "io";
 
 type State = {
 	config: SteerConfig | null;
 	load: LoadSample | null;
 	memory: MemorySample | null;
+	swap: SwapSample | null;
+	io: IoPressureSample | null;
 	loadBand: Band;
 	memoryBand: Band;
+	swapBand: Band;
+	ioBand: Band;
 	cpus: number;
 	/** One-shot guards so a broken sensor reports once per session, not per boundary. */
 	loadUnavailableNotified: boolean;
 	memoryUnavailableNotified: boolean;
+	swapUnavailableNotified: boolean;
+	ioUnavailableNotified: boolean;
 	configWarned: boolean;
 };
 
@@ -64,11 +73,17 @@ function makeState(): State {
 		config: null,
 		load: null,
 		memory: null,
+		swap: null,
+		io: null,
 		loadBand: "normal",
 		memoryBand: "normal",
+		swapBand: "normal",
+		ioBand: "normal",
 		cpus: cpuCount(),
 		loadUnavailableNotified: false,
 		memoryUnavailableNotified: false,
+		swapUnavailableNotified: false,
+		ioUnavailableNotified: false,
 		configWarned: false,
 	};
 }
@@ -96,41 +111,66 @@ function memoryText(sample: MemorySample | null): string {
  * There is no imperative anywhere in this function, and that is the point:
  * the reader gets the numbers and draws their own conclusion.
  */
+
+/** The band half of a signal's sentence: a crossing names both bands, an
+ *  unchanged signal names the one it is sitting in. The caller's sentence
+ *  carries no final punctuation so this can supply it. */
+function bandClause(change: { previous: Band; next: Band } | undefined, current: Band): string {
+	return change ? `. Band ${change.previous} -> ${change.next}.` : `, band ${current}.`;
+}
+
+/** Swap line body. A machine with no swap has a reading, not a percentage. */
+function swapSentence(sample: SwapSample): string {
+	if (sample.totalBytes === 0) return "Swap: none configured";
+	return (
+		`Swap: ${formatBytes(sample.usedBytes)} of ${formatBytes(sample.totalBytes)} in use ` +
+		`(${(sample.usedFraction * 100).toFixed(0)}%)`
+	);
+}
+
+/** I/O line body. The `full` share is named only when the kernel reported it. */
+function ioSentence(sample: IoPressureSample): string {
+	const some = (sample.some10 * 100).toFixed(1);
+	const full =
+		sample.full10 === null
+			? ""
+			: `, ${(sample.full10 * 100).toFixed(1)}% of wall time with every task stalled on I/O`;
+	return `I/O pressure: ${some}% of wall time with at least one task stalled on I/O${full}`;
+}
+
 function formatCombinedReport(
 	changes: Array<{ signal: Signal; previous: Band; next: Band }>,
 	state: State,
 ): string {
+	const changed = new Map<Signal, { previous: Band; next: Band }>();
+	for (const change of changes) changed.set(change.signal, change);
+
+	// Every signal with a reading gets a line, whether or not it changed, so one
+	// message carries the full picture. A signal without a reading gets no line
+	// at all, rather than a line describing what it does not have.
 	const lines: string[] = ["System resource update. Measurements only."];
 
-	for (const change of changes) {
-		if (change.signal === "load" && state.load?.available) {
-			lines.push(
-				`Load average: ${state.load.load1.toFixed(2)} (1 min), ${state.load.load5.toFixed(2)} (5 min), ` +
-					`${state.load.load15.toFixed(2)} (15 min) on ${state.cpus} logical CPUs. ` +
-					`Band ${change.previous} -> ${change.next}.`,
-			);
-		}
-		if (change.signal === "memory" && state.memory?.available) {
-			lines.push(
-				`Memory: ${formatBytes(state.memory.usedBytes)} of ${formatBytes(state.memory.totalBytes)} in use ` +
-					`(${(state.memory.usedFraction * 100).toFixed(0)}%). Band ${change.previous} -> ${change.next}.`,
-			);
-		}
-	}
-
-	// Mention any signal that did not change, so one message carries the full
-	// picture. A signal without a reading gets no line at all, rather than a
-	// line describing what it does not have.
-	if (!changes.some((change) => change.signal === "load") && state.load?.available) {
+	if (state.load?.available) {
+		const load = state.load;
 		lines.push(
-			`Load average: ${state.load.load1.toFixed(2)} (1 min) on ${state.cpus} logical CPUs, band ${state.loadBand}.`,
+			`Load average: ${load.load1.toFixed(2)} (1 min), ${load.load5.toFixed(2)} (5 min), ` +
+				`${load.load15.toFixed(2)} (15 min) on ${state.cpus} logical CPUs` +
+				bandClause(changed.get("load"), state.loadBand),
 		);
 	}
-	if (!changes.some((change) => change.signal === "memory") && state.memory?.available) {
+	if (state.memory?.available) {
+		const memory = state.memory;
 		lines.push(
-			`Memory: ${formatBytes(state.memory.usedBytes)} of ${formatBytes(state.memory.totalBytes)} in use ` +
-				`(${(state.memory.usedFraction * 100).toFixed(0)}%), band ${state.memoryBand}.`,
+			`Memory: ${formatBytes(memory.usedBytes)} of ${formatBytes(memory.totalBytes)} in use ` +
+				`(${(memory.usedFraction * 100).toFixed(0)}%)` +
+				bandClause(changed.get("memory"), state.memoryBand),
 		);
+	}
+	if (state.swap?.available) {
+		lines.push(swapSentence(state.swap) + bandClause(changed.get("swap"), state.swapBand));
+	}
+	if (state.io?.available) {
+		lines.push(ioSentence(state.io) + bandClause(changed.get("io"), state.ioBand));
 	}
 
 	return lines.join("\n");
@@ -142,14 +182,16 @@ function updateStatus(ctx: ExtensionContext, state: State): void {
 	const theme = ctx.ui.theme;
 	const load = state.load?.available ? state.load.load1.toFixed(2) : "—";
 	const memory = state.memory?.available ? `${(state.memory.usedFraction * 100).toFixed(0)}%` : "—";
-	const label = `load ${load}/${state.cpus} · mem ${memory}`;
+	const swap = !state.swap?.available
+		? "—"
+		: state.swap.totalBytes === 0
+			? "none"
+			: `${(state.swap.usedFraction * 100).toFixed(0)}%`;
+	const io = state.io?.available ? `${(state.io.some10 * 100).toFixed(0)}%` : "—";
+	const label = `load ${load}/${state.cpus} · mem ${memory} · swap ${swap} · io ${io}`;
 
-	const worst: Band =
-		state.loadBand === "high" || state.memoryBand === "high"
-			? "high"
-			: state.loadBand === "elevated" || state.memoryBand === "elevated"
-				? "elevated"
-				: "normal";
+	const bands: Band[] = [state.loadBand, state.memoryBand, state.swapBand, state.ioBand];
+	const worst: Band = bands.includes("high") ? "high" : bands.includes("elevated") ? "elevated" : "normal";
 	const painted =
 		worst === "high"
 			? theme?.fg("error", label)
@@ -164,6 +206,8 @@ export type SteerDeps = {
 	/** Injected for tests. Defaults to the real sampler. */
 	readLoadImpl?: () => Promise<LoadSample>;
 	readMemoryImpl?: () => Promise<MemorySample>;
+	readSwapImpl?: () => Promise<SwapSample>;
+	readIoPressureImpl?: () => Promise<IoPressureSample>;
 	loadConfigImpl?: typeof loadConfig;
 	cpuCountImpl?: () => number;
 };
@@ -174,6 +218,8 @@ function resolveDeps(deps: SteerDeps): ResolvedDeps {
 	return {
 		readLoadImpl: deps.readLoadImpl ?? readLoad,
 		readMemoryImpl: deps.readMemoryImpl ?? readMemory,
+		readSwapImpl: deps.readSwapImpl ?? readSwap,
+		readIoPressureImpl: deps.readIoPressureImpl ?? readIoPressure,
 		loadConfigImpl: deps.loadConfigImpl ?? loadConfig,
 		cpuCountImpl: deps.cpuCountImpl ?? cpuCount,
 	};
@@ -182,7 +228,7 @@ function resolveDeps(deps: SteerDeps): ResolvedDeps {
 /**
  * The single sampling step both boundaries share.
  *
- * Takes one sample of both sensors, moves each band through the state
+ * Takes one sample of every sensor, moves each band through the state
  * machine, and returns the text of one combined message if at least one band
  * crossed. Callers choose how to deliver the text: as the before_agent_start
  * result, or as a turn_end draft entry.
@@ -195,12 +241,20 @@ async function sampleAndReport(
 	const config = state.config;
 	if (!config) return null;
 
-	const [load, memory] = await Promise.all([deps.readLoadImpl(), deps.readMemoryImpl()]);
+	const [load, memory, swap, io] = await Promise.all([
+		deps.readLoadImpl(),
+		deps.readMemoryImpl(),
+		deps.readSwapImpl(),
+		deps.readIoPressureImpl(),
+	]);
 	state.load = load;
 	state.memory = memory;
+	state.swap = swap;
+	state.io = io;
 
 	// An unavailable sensor is surfaced where the user can see it, once, and
-	// its band holds until the sensor returns.
+	// its band holds until the sensor returns. A machine with no swap is not
+	// unavailable: the reader reports the absence as a reading.
 	if (!load.available && !state.loadUnavailableNotified) {
 		state.loadUnavailableNotified = true;
 		if (ctx.hasUI) ctx.ui.notify(`load-aware-steer: load average unavailable (${load.detail}).`, "warning");
@@ -210,6 +264,16 @@ async function sampleAndReport(
 		state.memoryUnavailableNotified = true;
 		if (ctx.hasUI) ctx.ui.notify(`load-aware-steer: memory unavailable (${memory.detail}).`, "warning");
 		console.error(`[load-aware-steer] memory unavailable: ${memory.detail}`);
+	}
+	if (!swap.available && !state.swapUnavailableNotified) {
+		state.swapUnavailableNotified = true;
+		if (ctx.hasUI) ctx.ui.notify(`load-aware-steer: swap unavailable (${swap.detail}).`, "warning");
+		console.error(`[load-aware-steer] swap unavailable: ${swap.detail}`);
+	}
+	if (!io.available && !state.ioUnavailableNotified) {
+		state.ioUnavailableNotified = true;
+		if (ctx.hasUI) ctx.ui.notify(`load-aware-steer: I/O pressure unavailable (${io.detail}).`, "warning");
+		console.error(`[load-aware-steer] I/O pressure unavailable: ${io.detail}`);
 	}
 
 	updateStatus(ctx, state);
@@ -233,6 +297,24 @@ async function sampleAndReport(
 		if (isCrossing(previous, next)) {
 			changes.push({ signal: "memory", previous, next });
 			state.memoryBand = next;
+		}
+	}
+
+	if (swap.available) {
+		const previous = state.swapBand;
+		const next = nextBand(previous, swap.usedFraction, config.swapThreshold, config);
+		if (isCrossing(previous, next)) {
+			changes.push({ signal: "swap", previous, next });
+			state.swapBand = next;
+		}
+	}
+
+	if (io.available) {
+		const previous = state.ioBand;
+		const next = nextBand(previous, io.some10, config.ioThreshold, config);
+		if (isCrossing(previous, next)) {
+			changes.push({ signal: "io", previous, next });
+			state.ioBand = next;
 		}
 	}
 
@@ -310,8 +392,12 @@ export default function loadAwareSteer(pi: ExtensionAPI, deps: SteerDeps = {}): 
 	pi.on("session_start", async (_event, ctx) => {
 		state.loadBand = "normal";
 		state.memoryBand = "normal";
+		state.swapBand = "normal";
+		state.ioBand = "normal";
 		state.loadUnavailableNotified = false;
 		state.memoryUnavailableNotified = false;
+		state.swapUnavailableNotified = false;
+		state.ioUnavailableNotified = false;
 		state.cpus = resolved.cpuCountImpl();
 		state.config = await resolved.loadConfigImpl();
 
@@ -335,5 +421,7 @@ export default function loadAwareSteer(pi: ExtensionAPI, deps: SteerDeps = {}): 
 		if (ctx.hasUI) ctx.ui.setStatus(STATUS_KEY, undefined);
 		state.loadBand = "normal";
 		state.memoryBand = "normal";
+		state.swapBand = "normal";
+		state.ioBand = "normal";
 	});
 }

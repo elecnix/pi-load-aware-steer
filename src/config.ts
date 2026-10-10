@@ -22,10 +22,16 @@ export type SteerConfig = BandConfig & {
 	loadThreshold: number;
 	/** Fraction of installed RAM in use at which the `elevated` band engages, 0-1. */
 	memoryThreshold: number;
+	/** Fraction of swap in use at which the `elevated` band engages, 0-1. */
+	swapThreshold: number;
+	/** Fraction of wall time stalled on I/O at which the `elevated` band engages, 0-1. */
+	ioThreshold: number;
 	/** Master switch. When false the extension samples and shows a status line but announces nothing. */
 	enabled: boolean;
 	loadThresholdSource: ThresholdSource;
 	memoryThresholdSource: ThresholdSource;
+	swapThresholdSource: ThresholdSource;
+	ioThresholdSource: ThresholdSource;
 	/** Non-fatal problems found while loading config. */
 	warnings: string[];
 };
@@ -48,6 +54,12 @@ export const DEFAULTS = {
 	loadThreshold: cpuCount(),
 	/** 80% of installed RAM. */
 	memoryThresholdPercent: 80,
+	/** Half of installed swap. Swap fills and does not drain on its own, so the
+	 *  default is set below the memory one to say something before the machine
+	 *  is close to running out of backing store. */
+	swapThresholdPercent: 50,
+	/** 20% of wall time with at least one task stalled on I/O. */
+	ioPressureThresholdPercent: 20,
 	enabled: true,
 } as const;
 
@@ -133,11 +145,49 @@ export async function loadConfig(options: LoadConfigOptions = {}): Promise<Steer
 
 	const enabled = boolFrom(env.LOAD_AWARE_STEER_ENABLED) ?? fileBool("enabled") ?? DEFAULTS.enabled;
 
+	// Swap and I/O pressure are configured as percentages of a whole for the
+	// same reason memory is: that is how people reason about them. Each is
+	// stored as a fraction for comparison, and a value outside (0, 100] is
+	// reported and replaced rather than silently accepted.
+	const fractionThreshold = (
+		envValue: string | undefined,
+		fileKey: string,
+		defaultPercent: number,
+		label: string,
+	): { value: number; source: ThresholdSource } => {
+		const envNumber = numberFrom(envValue);
+		const fileNumberValue = fileNumber(fileKey);
+		const percent = envNumber ?? fileNumberValue ?? defaultPercent;
+		const source: ThresholdSource = envNumber !== undefined ? "env" : fileNumberValue !== undefined ? "file" : "default";
+		if (percent <= 0 || percent > 100) {
+			warnings.push(`${label} ${percent} outside (0, 100]; using default ${defaultPercent}`);
+			return { value: defaultPercent / 100, source };
+		}
+		return { value: percent / 100, source };
+	};
+
+	const swap = fractionThreshold(
+		env.LOAD_AWARE_STEER_SWAP_THRESHOLD,
+		"swapThresholdPercent",
+		DEFAULTS.swapThresholdPercent,
+		"swapThresholdPercent",
+	);
+	const io = fractionThreshold(
+		env.LOAD_AWARE_STEER_IO_THRESHOLD,
+		"ioPressureThresholdPercent",
+		DEFAULTS.ioPressureThresholdPercent,
+		"ioPressureThresholdPercent",
+	);
+
 	return {
 		loadThreshold: loadThreshold > 0 ? loadThreshold : DEFAULTS.loadThreshold,
 		loadThresholdSource,
 		memoryThreshold,
 		memoryThresholdSource,
+		swapThreshold: swap.value,
+		swapThresholdSource: swap.source,
+		ioThreshold: io.value,
+		ioThresholdSource: io.source,
 		enabled,
 		warnings,
 		elevatedMultiplier: DEFAULT_BAND_CONFIG.elevatedMultiplier,
