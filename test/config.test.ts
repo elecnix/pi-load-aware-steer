@@ -80,6 +80,36 @@ test("a threshold outside (0, 100] warns and falls back to the default", async (
 	}
 });
 
+test("a rejected value reports the default as its source, not where it came from", async () => {
+	// The env var is out of range, so the number in use is the default. Saying
+	// "env" would claim the environment supplied a value it did not.
+	const config = await load({
+		LOAD_AWARE_STEER_MEMORY_THRESHOLD: "0",
+		LOAD_AWARE_STEER_SWAP_THRESHOLD: "150",
+		LOAD_AWARE_STEER_IO_THRESHOLD: "0",
+	});
+	assert.equal(config.memoryThreshold, 0.8);
+	assert.equal(config.memoryThresholdSource, "default");
+	assert.equal(config.swapThreshold, 0.5);
+	assert.equal(config.swapThresholdSource, "default");
+	assert.equal(config.ioThreshold, 0.2);
+	assert.equal(config.ioThresholdSource, "default");
+
+	// The load threshold is rejected on the same rule, and reports the same way.
+	const rejectedLoad = await load({ LOAD_AWARE_STEER_LOAD_THRESHOLD: "0" });
+	assert.equal(rejectedLoad.loadThreshold, DEFAULTS.loadThreshold);
+	assert.equal(rejectedLoad.loadThresholdSource, "default");
+
+	// The same rule through the file path.
+	const fromFile = await load(
+		{},
+		JSON.stringify({ memoryThresholdPercent: 0, swapThresholdPercent: 0, ioPressureThresholdPercent: 0 }),
+	);
+	assert.equal(fromFile.memoryThresholdSource, "default");
+	assert.equal(fromFile.swapThresholdSource, "default");
+	assert.equal(fromFile.ioThresholdSource, "default");
+});
+
 test("a non-numeric environment value is ignored, not treated as zero", async () => {
 	const config = await load({ LOAD_AWARE_STEER_SWAP_THRESHOLD: "half" });
 	assert.equal(config.swapThreshold, 0.5);

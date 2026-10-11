@@ -97,7 +97,7 @@ export function parseMeminfoSwap(output: string): { totalBytes: number; freeByte
 	return { totalBytes: total * 1024, freeBytes: free * 1024 };
 }
 
-const BINARY_UNITS: Record<string, number> = { K: 1024, M: 1024 ** 2, G: 1024 ** 3 };
+const BINARY_UNITS: Record<string, number | undefined> = { K: 1024, M: 1024 ** 2, G: 1024 ** 3 };
 
 /**
  * Parse `sysctl -n vm.swapusage`. The line reads
@@ -110,7 +110,10 @@ export function parseSwapusage(output: string): { totalBytes: number; usedBytes:
 		if (!match) return null;
 		const value = Number(match[1]);
 		const unit = BINARY_UNITS[match[2]];
-		if (!Number.isFinite(value)) return null;
+		// The capture is limited to [KMG], so an unknown unit means the format
+		// changed under us. Report nothing rather than multiply by undefined and
+		// return NaN as a swap figure.
+		if (!Number.isFinite(value) || unit === undefined) return null;
 		return value * unit;
 	};
 

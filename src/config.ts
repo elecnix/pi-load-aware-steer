@@ -120,35 +120,21 @@ export async function loadConfig(options: LoadConfigOptions = {}): Promise<Steer
 	const loadThresholdSource: ThresholdSource =
 		loadEnv !== undefined ? "env" : loadFile !== undefined ? "file" : "default";
 
-	if (loadThreshold <= 0) {
+	// A non-positive load threshold is rejected the same way an out-of-range
+	// percentage is: the default replaces it, and the source says "default"
+	// because that is the value in use.
+	const loadRejected = loadThreshold <= 0;
+	if (loadRejected) {
 		warnings.push(`loadThreshold ${loadThreshold} is not positive; using default ${DEFAULTS.loadThreshold}`);
 	}
 
-	// Memory is configured as a percentage because that is how people reason
-	// about RAM, and stored as a fraction because that is how it is compared.
-	const memoryEnv = numberFrom(env.LOAD_AWARE_STEER_MEMORY_THRESHOLD);
-	const memoryFile = fileNumber("memoryThresholdPercent");
-	const rawMemoryPercent = memoryEnv ?? memoryFile ?? DEFAULTS.memoryThresholdPercent;
-	const memoryThresholdSource: ThresholdSource =
-		memoryEnv !== undefined ? "env" : memoryFile !== undefined ? "file" : "default";
-
-	if (rawMemoryPercent <= 0 || rawMemoryPercent > 100) {
-		warnings.push(`memoryThresholdPercent ${rawMemoryPercent} outside (0, 100]; using default ${DEFAULTS.memoryThresholdPercent}`);
-	}
-	const memoryThreshold =
-		rawMemoryPercent > 0 && rawMemoryPercent <= 100 ? rawMemoryPercent / 100 : DEFAULTS.memoryThresholdPercent / 100;
-
-	const hysteresis = numberFrom(env.LOAD_AWARE_STEER_HYSTERESIS) ?? fileNumber("hysteresis");
-	if (hysteresis !== undefined && (hysteresis < 0 || hysteresis >= 1)) {
-		warnings.push(`hysteresis ${hysteresis} outside [0, 1); using default ${DEFAULT_BAND_CONFIG.hysteresis}`);
-	}
-
-	const enabled = boolFrom(env.LOAD_AWARE_STEER_ENABLED) ?? fileBool("enabled") ?? DEFAULTS.enabled;
-
-	// Swap and I/O pressure are configured as percentages of a whole for the
-	// same reason memory is: that is how people reason about them. Each is
-	// stored as a fraction for comparison, and a value outside (0, 100] is
-	// reported and replaced rather than silently accepted.
+	// Memory, swap and I/O pressure are each configured as a percentage of a
+	// whole because that is how people reason about them, and stored as a
+	// fraction because that is how they are compared. A value outside (0, 100]
+	// is reported and replaced by the default, and the source then reads
+	// "default" too: the number in use came from the default, and saying the
+	// env var or the file supplied it would misreport where the threshold came
+	// from.
 	const fractionThreshold = (
 		envValue: string | undefined,
 		fileKey: string,
@@ -161,10 +147,24 @@ export async function loadConfig(options: LoadConfigOptions = {}): Promise<Steer
 		const source: ThresholdSource = envNumber !== undefined ? "env" : fileNumberValue !== undefined ? "file" : "default";
 		if (percent <= 0 || percent > 100) {
 			warnings.push(`${label} ${percent} outside (0, 100]; using default ${defaultPercent}`);
-			return { value: defaultPercent / 100, source };
+			return { value: defaultPercent / 100, source: "default" };
 		}
 		return { value: percent / 100, source };
 	};
+
+	const memory = fractionThreshold(
+		env.LOAD_AWARE_STEER_MEMORY_THRESHOLD,
+		"memoryThresholdPercent",
+		DEFAULTS.memoryThresholdPercent,
+		"memoryThresholdPercent",
+	);
+
+	const hysteresis = numberFrom(env.LOAD_AWARE_STEER_HYSTERESIS) ?? fileNumber("hysteresis");
+	if (hysteresis !== undefined && (hysteresis < 0 || hysteresis >= 1)) {
+		warnings.push(`hysteresis ${hysteresis} outside [0, 1); using default ${DEFAULT_BAND_CONFIG.hysteresis}`);
+	}
+
+	const enabled = boolFrom(env.LOAD_AWARE_STEER_ENABLED) ?? fileBool("enabled") ?? DEFAULTS.enabled;
 
 	const swap = fractionThreshold(
 		env.LOAD_AWARE_STEER_SWAP_THRESHOLD,
@@ -180,10 +180,10 @@ export async function loadConfig(options: LoadConfigOptions = {}): Promise<Steer
 	);
 
 	return {
-		loadThreshold: loadThreshold > 0 ? loadThreshold : DEFAULTS.loadThreshold,
-		loadThresholdSource,
-		memoryThreshold,
-		memoryThresholdSource,
+		loadThreshold: loadRejected ? DEFAULTS.loadThreshold : loadThreshold,
+		loadThresholdSource: loadRejected ? "default" : loadThresholdSource,
+		memoryThreshold: memory.value,
+		memoryThresholdSource: memory.source,
 		swapThreshold: swap.value,
 		swapThresholdSource: swap.source,
 		ioThreshold: io.value,
