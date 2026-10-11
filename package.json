@@ -4,12 +4,15 @@
   "private": true,
   "type": "module",
   "license": "MIT",
-  "description": "Pi extension that reports system load and memory usage in the conversation when either changes band",
+  "description": "Pi extension that reports system load, memory usage, swap usage and disk I/O pressure in the conversation when any of them changes band",
   "keywords": [
     "pi",
     "pi-extension",
     "load-average",
     "memory",
+    "swap",
+    "psi",
+    "io-pressure",
     "monitoring"
   ],
   "repository": {
@@ -18,7 +21,7 @@
   },
   "scripts": {
     "check": "tsc --noEmit",
-    "test": "node --test test/signals.test.ts test/load.test.ts test/memory.test.ts test/extension.test.ts"
+    "test": "node --test test/signals.test.ts test/load.test.ts test/memory.test.ts test/swap.test.ts test/io.test.ts test/config.test.ts test/extension.test.ts"
   },
   "pi": {
     "extensions": [

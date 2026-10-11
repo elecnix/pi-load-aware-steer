@@ -21,6 +21,8 @@ import assert from "node:assert/strict";
 import loadAwareSteer, { type SteerDeps } from "../index.ts";
 import type { LoadSample } from "../src/load.ts";
 import type { MemorySample } from "../src/memory.ts";
+import type { SwapSample } from "../src/swap.ts";
+import type { IoPressureSample } from "../src/io.ts";
 import type { SteerConfig } from "../src/config.ts";
 
 const GIB = 1024 ** 3;
@@ -52,13 +54,44 @@ function memorySample(fraction: number, source: MemorySample["source"] = "node:o
 	};
 }
 
+function swapSample(fraction: number, totalBytes = 8 * GIB): SwapSample {
+	return {
+		available: true,
+		totalBytes,
+		usedBytes: Math.round(totalBytes * fraction),
+		usedFraction: fraction,
+		source: "/proc/meminfo",
+	};
+}
+
+/** A machine with swap disabled: a reading of nothing, not a failure. */
+function unconfiguredSwap(): SwapSample {
+	return { available: true, totalBytes: 0, usedBytes: 0, usedFraction: 0, source: "/proc/meminfo" };
+}
+
+function unavailableSwap(): SwapSample {
+	return { available: false, totalBytes: 0, usedBytes: 0, usedFraction: 0, source: "unavailable", detail: "test: no sensor" };
+}
+
+function ioSample(some10: number, full10: number | null = some10 / 4): IoPressureSample {
+	return { available: true, some10, full10, source: "/proc/pressure/io" };
+}
+
+function unavailableIo(): IoPressureSample {
+	return { available: false, some10: 0, full10: null, source: "unavailable", detail: "test: no sensor" };
+}
+
 function testConfig(overrides: Partial<SteerConfig> = {}): SteerConfig {
 	return {
 		loadThreshold: 4,
 		memoryThreshold: 0.8,
+		swapThreshold: 0.5,
+		ioThreshold: 0.2,
 		enabled: true,
 		loadThresholdSource: "default",
 		memoryThresholdSource: "default",
+		swapThresholdSource: "default",
+		ioThresholdSource: "default",
 		warnings: [],
 		elevatedMultiplier: 1,
 		highMultiplier: 1.5,
@@ -79,8 +112,18 @@ function makeHarness(config: SteerConfig) {
 	const handlers = new Map<string, Handler>();
 
 	// The test drives the machine by writing to this object.
-	const box = { load1: 0.5, loadAvailable: true, memory: 0.3, memorySource: "node:os" as MemorySample["source"] };
-	const calls = { load: 0, memory: 0 };
+	const box = {
+		load1: 0.5,
+		loadAvailable: true,
+		memory: 0.3,
+		memorySource: "node:os" as MemorySample["source"],
+		swap: 0.1,
+		swapTotal: 8 * GIB,
+		swapAvailable: true,
+		io: 0.05,
+		ioAvailable: true,
+	};
+	const calls = { load: 0, memory: 0, swap: 0, io: 0 };
 
 	const deps: SteerDeps = {
 		readLoadImpl: async () => {
@@ -90,6 +133,15 @@ function makeHarness(config: SteerConfig) {
 		readMemoryImpl: async () => {
 			calls.memory++;
 			return memorySample(box.memory, box.memorySource);
+		},
+		readSwapImpl: async () => {
+			calls.swap++;
+			if (!box.swapAvailable) return unavailableSwap();
+			return box.swapTotal === 0 ? unconfiguredSwap() : swapSample(box.swap, box.swapTotal);
+		},
+		readIoPressureImpl: async () => {
+			calls.io++;
+			return box.ioAvailable ? ioSample(box.io) : unavailableIo();
 		},
 		loadConfigImpl: async () => config,
 		cpuCountImpl: () => 10,
@@ -197,9 +249,11 @@ test("session start samples nothing and reports nothing", async () => {
 	const h = makeHarness(testConfig());
 	h.box.load1 = 50;
 	h.box.memory = 0.99;
+	h.box.swap = 0.99;
+	h.box.io = 0.99;
 	await h.start();
 
-	assert.equal(h.calls.load + h.calls.memory, 0, "a session that never prompts is never sampled");
+	assert.equal(h.calls.load + h.calls.memory + h.calls.swap + h.calls.io, 0, "a session that never prompts is never sampled");
 	assert.equal(h.sent.length, 0);
 	await h.stop();
 });
@@ -483,6 +537,74 @@ test("a dead sensor is left out of the message", async () => {
 	await h.stop();
 });
 
+test("swap and I/O crossing in one sample produce one message", async () => {
+	const h = makeHarness(testConfig());
+	await h.start();
+
+	h.box.swap = 0.6; // swap threshold 0.5
+	h.box.io = 0.25; // I/O threshold 0.2
+	const text = (await h.prompt())?.message?.content ?? "";
+
+	assert.equal(text.match(/System resource update/g)?.length, 1, "one message, not one per signal");
+	assert.match(text, /Swap: 4\.8 GiB of 8\.0 GiB in use \(60%\)\. Band normal -> elevated\./);
+	assert.match(
+		text,
+		/I\/O pressure: 25\.0% of wall time with at least one task stalled on I\/O, 6\.3% of wall time with every task stalled on I\/O\. Band normal -> elevated\./,
+	);
+	assert.equal(text.match(DIRECTIVE_PATTERN), null, "the new signal lines are measurements too");
+	await h.stop();
+});
+
+test("a machine with no swap reports none configured rather than a dead sensor", async () => {
+	const h = makeHarness(testConfig());
+	await h.start();
+
+	h.box.swapTotal = 0;
+	h.box.load1 = 5; // enough to carry a message
+	const text = (await h.prompt())?.message?.content ?? "";
+
+	assert.match(text, /Swap: none configured, band normal\./);
+	assert.equal(
+		h.notifications.some((message) => /swap unavailable/.test(message)),
+		false,
+		"a machine with swap disabled is a reading, not a failure",
+	);
+	assert.match(String(h.statuses.at(-1)?.value), /swap none/);
+	await h.stop();
+});
+
+test("a dead swap or I/O sensor holds its band and is surfaced once", async () => {
+	const h = makeHarness(testConfig());
+	await h.start();
+
+	h.box.swap = 0.9;
+	h.box.io = 0.5;
+	assert.match((await h.prompt())?.message?.content ?? "", /Swap:.*Band normal -> high/);
+
+	// Missing data must not read as recovery, and must not guess a band.
+	h.box.swapAvailable = false;
+	h.box.ioAvailable = false;
+	assert.equal((await h.prompt())?.message, undefined, "unavailable data must not move a band");
+	assert.equal(h.notifications.filter((message) => /swap unavailable/.test(message)).length, 1);
+	assert.equal(h.notifications.filter((message) => /I\/O pressure unavailable/.test(message)).length, 1);
+	await h.stop();
+});
+
+test("an unchanged swap or I/O reading still appears in a message", async () => {
+	const h = makeHarness(testConfig());
+	await h.start();
+
+	h.box.load1 = 5; // the only crossing
+	const text = (await h.prompt())?.message?.content ?? "";
+
+	assert.match(text, /Swap: 819 MiB of 8\.0 GiB in use \(10%\), band normal\./);
+	assert.match(
+		text,
+		/I\/O pressure: 5\.0% of wall time with at least one task stalled on I\/O, 1\.3% of wall time with every task stalled on I\/O, band normal\./,
+	);
+	await h.stop();
+});
+
 test("a disabled extension samples but stays silent", async () => {
 	const h = makeHarness(testConfig({ enabled: false }));
 	await h.start();
@@ -511,11 +633,13 @@ test("the status line shows the latest sample", async () => {
 
 	h.box.load1 = 2.5;
 	h.box.memory = 0.5;
+	h.box.swap = 0.3;
+	h.box.io = 0.05;
 	await h.prompt();
 
 	const last = h.statuses.at(-1);
 	assert.equal(last?.key, "load-aware-steer");
-	assert.equal(last?.value, "load 2.50/10 · mem 50%");
+	assert.equal(last?.value, "load 2.50/10 · mem 50% · swap 30% · io 5%");
 	await h.stop();
 });
 
