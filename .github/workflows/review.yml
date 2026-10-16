@@ -27,7 +27,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Review this pull request with Cite
-        uses: elecnix/cite@fd044627fae54eed1d9f5603c2334aa77c002e01  # v0.15.0
+        uses: elecnix/cite@f5707676437aacf2d3566d0e831c5c558717f994 # v0.15.0
         with:
           # The pin is a full SHA on purpose: an unset `version:` input makes
           # the action download the release its pin belongs to, so the SHA
