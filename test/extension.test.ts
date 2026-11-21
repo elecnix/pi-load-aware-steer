@@ -81,6 +81,16 @@ function unavailableIo(): IoPressureSample {
 	return { available: false, some10: 0, full10: null, source: "unavailable", detail: "test: no sensor" };
 }
 
+function unsupportedIo(): IoPressureSample {
+	return {
+		available: false,
+		some10: 0,
+		full10: null,
+		source: "unsupported",
+		detail: "no pressure stall accounting on darwin",
+	};
+}
+
 function testConfig(overrides: Partial<SteerConfig> = {}): SteerConfig {
 	return {
 		loadThreshold: 4,
@@ -122,6 +132,8 @@ function makeHarness(config: SteerConfig) {
 		swapAvailable: true,
 		io: 0.05,
 		ioAvailable: true,
+		ioUnsupported: false,
+		hasUI: true,
 	};
 	const calls = { load: 0, memory: 0, swap: 0, io: 0 };
 
@@ -141,6 +153,7 @@ function makeHarness(config: SteerConfig) {
 		},
 		readIoPressureImpl: async () => {
 			calls.io++;
+			if (box.ioUnsupported) return unsupportedIo();
 			return box.ioAvailable ? ioSample(box.io) : unavailableIo();
 		},
 		loadConfigImpl: async () => config,
@@ -162,7 +175,9 @@ function makeHarness(config: SteerConfig) {
 	};
 
 	const ctx = {
-		hasUI: true,
+		get hasUI() {
+			return box.hasUI;
+		},
 		ui: {
 			theme: { fg: (_color: string, text: string) => text },
 			setStatus(key: string, value: unknown) {
@@ -588,6 +603,101 @@ test("a dead swap or I/O sensor holds its band and is surfaced once", async () =
 	assert.equal(h.notifications.filter((message) => /swap unavailable/.test(message)).length, 1);
 	assert.equal(h.notifications.filter((message) => /I\/O pressure unavailable/.test(message)).length, 1);
 	await h.stop();
+});
+
+test("a platform with no I/O stall accounting says nothing at all", async () => {
+	const h = makeHarness(testConfig());
+	await h.start();
+
+	// macOS and Windows have no PSI. That is a known absence, not a fault, so
+	// it must not warn, must not move a band, and must not claim a reading.
+	h.box.ioAvailable = false;
+	h.box.ioUnsupported = true;
+	assert.equal((await h.prompt())?.message, undefined, "an unsupported signal carries no line");
+	assert.equal(
+		h.notifications.filter((message) => /I\/O pressure/.test(message)).length,
+		0,
+		"a missing platform feature is never announced as a dead sensor",
+	);
+	assert.match(String(h.statuses.at(-1)?.value), /io —/, "the footer shows the gap rather than inventing a figure");
+
+	// The same absence on the next sample stays silent too.
+	assert.equal((await h.prompt())?.message, undefined);
+	assert.equal(h.notifications.length, 0);
+	await h.stop();
+});
+
+test("a supported platform that loses its sensor still warns", async () => {
+	const h = makeHarness(testConfig());
+	await h.start();
+
+	h.box.ioAvailable = false;
+	h.box.ioUnsupported = false; // Linux whose /proc/pressure/io cannot be read
+	await h.prompt();
+
+	assert.equal(
+		h.notifications.filter((message) => /I\/O pressure unavailable/.test(message)).length,
+		1,
+		"a real fault is still surfaced once",
+	);
+	await h.stop();
+});
+
+test("a diagnostic with a UI attached never writes to the console", async () => {
+	const written: string[] = [];
+	const original = { error: console.error, warn: console.warn, log: console.log };
+	console.error = (...args: unknown[]) => written.push(`[error] ${args.map(String).join(" ")}`);
+	console.warn = (...args: unknown[]) => written.push(`[warn] ${args.map(String).join(" ")}`);
+	console.log = (...args: unknown[]) => written.push(`[log] ${args.map(String).join(" ")}`);
+
+	try {
+		const h = makeHarness(testConfig());
+		await h.start();
+
+		// Every sensor fails at once: the worst case for console noise.
+		h.box.loadAvailable = false;
+		h.box.swapAvailable = false;
+		h.box.ioAvailable = false;
+		h.box.ioUnsupported = false;
+		await h.prompt();
+
+		assert.ok(h.notifications.length >= 2, "the reader is told through the UI");
+		assert.deepEqual(
+			written.filter((line) => /load-aware-steer/.test(line)),
+			[],
+			"a raw console write paints over pi's frame instead of into it",
+		);
+		await h.stop();
+	} finally {
+		console.error = original.error;
+		console.warn = original.warn;
+		console.log = original.log;
+	}
+});
+
+test("a headless run has no UI to tell, so the diagnostic goes to stderr", async () => {
+	const written: string[] = [];
+	const original = console.error;
+	console.error = (...args: unknown[]) => written.push(args.map(String).join(" "));
+
+	try {
+		const h = makeHarness(testConfig());
+		await h.start();
+
+		// Same failure, no UI: someone reading a log is the only audience.
+		h.box.ioAvailable = false;
+		h.box.ioUnsupported = false;
+		h.box.hasUI = false;
+		await h.prompt();
+
+		assert.ok(
+			written.some((line) => /load-aware-steer/.test(line) && /I\/O pressure/.test(line)),
+			`a headless run records the fault: ${JSON.stringify(written)}`,
+		);
+		await h.stop();
+	} finally {
+		console.error = original;
+	}
 });
 
 test("an unchanged swap or I/O reading still appears in a message", async () => {

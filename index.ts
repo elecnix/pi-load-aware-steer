@@ -176,6 +176,23 @@ function formatCombinedReport(
 	return lines.join("\n");
 }
 
+/**
+ * Report a diagnostic to whoever can act on it.
+ *
+ * While pi owns the terminal it renders a full-screen frame, and a raw
+ * `console.error` writes into that frame instead of into a log the reader can
+ * scroll: the text lands over the interface and scrolls away with the next
+ * repaint. So the UI carries the message when there is a UI, and stderr is the
+ * fallback for a headless run, where nothing is drawing.
+ */
+function diagnose(ctx: ExtensionContext, message: string): void {
+	if (ctx.hasUI) {
+		ctx.ui.notify(`load-aware-steer: ${message}`, "warning");
+		return;
+	}
+	console.error(`[load-aware-steer] ${message}`);
+}
+
 /** Keep the footer status current. Presentation only, no thresholds implied. */
 function updateStatus(ctx: ExtensionContext, state: State): void {
 	if (!ctx.hasUI) return;
@@ -254,26 +271,24 @@ async function sampleAndReport(
 
 	// An unavailable sensor is surfaced where the user can see it, once, and
 	// its band holds until the sensor returns. A machine with no swap is not
-	// unavailable: the reader reports the absence as a reading.
+	// unavailable: the reader reports the absence as a reading. Neither is a
+	// platform that has no such sensor at all: macOS and Windows publish no
+	// pressure stall accounting, so there is nothing broken to announce there.
 	if (!load.available && !state.loadUnavailableNotified) {
 		state.loadUnavailableNotified = true;
-		if (ctx.hasUI) ctx.ui.notify(`load-aware-steer: load average unavailable (${load.detail}).`, "warning");
-		console.error(`[load-aware-steer] load unavailable: ${load.detail}`);
+		diagnose(ctx, `load average unavailable (${load.detail}).`);
 	}
 	if (!memory.available && !state.memoryUnavailableNotified) {
 		state.memoryUnavailableNotified = true;
-		if (ctx.hasUI) ctx.ui.notify(`load-aware-steer: memory unavailable (${memory.detail}).`, "warning");
-		console.error(`[load-aware-steer] memory unavailable: ${memory.detail}`);
+		diagnose(ctx, `memory unavailable (${memory.detail}).`);
 	}
 	if (!swap.available && !state.swapUnavailableNotified) {
 		state.swapUnavailableNotified = true;
-		if (ctx.hasUI) ctx.ui.notify(`load-aware-steer: swap unavailable (${swap.detail}).`, "warning");
-		console.error(`[load-aware-steer] swap unavailable: ${swap.detail}`);
+		diagnose(ctx, `swap unavailable (${swap.detail}).`);
 	}
-	if (!io.available && !state.ioUnavailableNotified) {
+	if (!io.available && io.source !== "unsupported" && !state.ioUnavailableNotified) {
 		state.ioUnavailableNotified = true;
-		if (ctx.hasUI) ctx.ui.notify(`load-aware-steer: I/O pressure unavailable (${io.detail}).`, "warning");
-		console.error(`[load-aware-steer] I/O pressure unavailable: ${io.detail}`);
+		diagnose(ctx, `I/O pressure unavailable (${io.detail}).`);
 	}
 
 	updateStatus(ctx, state);

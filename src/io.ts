@@ -24,12 +24,19 @@
  *
  * PSI is Linux-only. macOS and Windows publish no equivalent accounting, and
  * a utilization or queue-depth number would answer a different question, so
- * those platforms report `available: false` rather than a stand-in.
+ * those platforms report `available: false` with source `unsupported`, which
+ * marks an expected absence rather than a sensor that failed.
  */
 
 import { readFile } from "node:fs/promises";
 
-export type IoPressureSource = "/proc/pressure/io" | "unavailable";
+/**
+ * `unsupported` marks an expected platform absence — macOS and Windows have no
+ * pressure stall accounting — and is distinct from `unavailable`, which marks
+ * a Linux machine whose PSI source cannot be read. Callers surface a dead
+ * sensor; a missing feature is not a fault.
+ */
+export type IoPressureSource = "/proc/pressure/io" | "unavailable" | "unsupported";
 
 export type IoPressureSample = {
 	/** False when no source could produce usable numbers. Never guess a value. */
@@ -86,6 +93,10 @@ function unavailable(detail: string): IoPressureSample {
 	return { available: false, some10: 0, full10: null, source: "unavailable", detail };
 }
 
+function unsupported(detail: string): IoPressureSample {
+	return { available: false, some10: 0, full10: null, source: "unsupported", detail };
+}
+
 /**
  * Read disk I/O pressure. Never throws: a missing or unreadable PSI file is
  * reported as `available: false` so callers can stay quiet rather than guess.
@@ -93,7 +104,7 @@ function unavailable(detail: string): IoPressureSample {
 export async function readIoPressure(options: IoPressureReaderOptions = {}): Promise<IoPressureSample> {
 	const platform = options.platform ?? process.platform;
 	if (platform !== "linux") {
-		return unavailable(`no pressure stall accounting on ${platform}`);
+		return unsupported(`no pressure stall accounting on ${platform}`);
 	}
 
 	const read = options.readFileImpl ?? ((path: string) => readFile(path, "utf8"));

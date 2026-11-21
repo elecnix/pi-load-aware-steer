@@ -82,19 +82,34 @@ test("Linux reports unavailable when the file has no some line", async () => {
 	assert.equal(sample.some10, 0, "unavailable is not a stall reading");
 });
 
-test("a platform without pressure stall accounting reports unavailable", async () => {
+test("a platform without pressure stall accounting reports unsupported, not unavailable", async () => {
 	for (const platform of ["darwin", "win32"] as const) {
 		const sample = await readIoPressure({ platform });
 		assert.equal(sample.available, false, `${platform} has no PSI`);
-		assert.equal(sample.source, "unavailable");
+		assert.equal(sample.source, "unsupported", `${platform} is an expected absence, not a dead sensor`);
 		assert.match(String(sample.detail), new RegExp(platform));
 	}
+});
+
+test("Linux keeps reporting unavailable when the PSI source cannot be read", async () => {
+	const sample = await readIoPressure({
+		platform: "linux",
+		readFileImpl: async () => {
+			throw new Error("EACCES");
+		},
+	});
+	assert.equal(sample.source, "unavailable", "a readable platform with an unreadable source is a fault");
 });
 
 test("a real reading on Linux is available and bounded", async () => {
 	const sample = await readIoPressure();
 	if (!sample.available) {
-		assert.equal(sample.source, "unavailable");
+		// On a host with no PSI the reader must name its reason rather than
+		// presenting zeros as a measurement.
+		assert.ok(
+			sample.source === "unsupported" || sample.source === "unavailable",
+			`an unavailable sample names why: ${sample.source}`,
+		);
 		assert.ok(sample.detail);
 		return;
 	}
