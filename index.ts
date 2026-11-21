@@ -448,6 +448,12 @@ export default function loadAwareSteer(pi: ExtensionAPI, deps: SteerDeps = {}): 
 		state.memoryUnavailableNotified = false;
 		state.swapUnavailableNotified = false;
 		state.ioUnavailableNotified = false;
+		// A rate is measured between two samples of one session. The I/O figure
+		// differences a cumulative counter, so carrying either the counter or the
+		// clock across a session boundary would divide a short interval of work by
+		// however long the process sat idle in between.
+		state.io = null;
+		state.lastSampleAt = null;
 		state.cpus = resolved.cpuCountImpl();
 		state.config = await resolved.loadConfigImpl();
 
@@ -473,5 +479,7 @@ export default function loadAwareSteer(pi: ExtensionAPI, deps: SteerDeps = {}): 
 		state.memoryBand = "normal";
 		state.swapBand = "normal";
 		state.ioBand = "normal";
+		state.io = null;
+		state.lastSampleAt = null;
 	});
 }

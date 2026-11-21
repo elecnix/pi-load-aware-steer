@@ -160,7 +160,13 @@ function makeHarness(config: SteerConfig) {
 		ioMeasure: "stall" as IoMeasure,
 		hasUI: true,
 	};
-	const calls = { load: 0, memory: 0, swap: 0, io: 0 };
+	const calls = {
+		load: 0,
+		memory: 0,
+		swap: 0,
+		io: 0,
+		ioArgs: [] as Array<{ previous: IoPressureSample | null; elapsedMs: number }>,
+	};
 
 	const deps: SteerDeps = {
 		readLoadImpl: async () => {
@@ -176,8 +182,9 @@ function makeHarness(config: SteerConfig) {
 			if (!box.swapAvailable) return unavailableSwap();
 			return box.swapTotal === 0 ? unconfiguredSwap() : swapSample(box.swap, box.swapTotal);
 		},
-		readIoPressureImpl: async () => {
+		readIoPressureImpl: async (options: { previous: IoPressureSample | null; elapsedMs: number }) => {
 			calls.io++;
+			calls.ioArgs.push(options);
 			if (box.ioUnsupported) return unsupportedIo();
 			if (box.ioWarming) return warmingBusyIo();
 			if (!box.ioAvailable) return unavailableIo();
@@ -906,5 +913,25 @@ test("the footer never uses the error colour", async () => {
 	await h.prompt();
 
 	assert.equal(h.statusColors.includes("error"), false, "error is reserved for something the reader can act on");
+	await h.stop();
+});
+
+test("a second session in one process does not inherit the first one's I/O baseline", async () => {
+	// The baseline is a cumulative counter, so differencing it across an idle
+	// gap between sessions would divide a short busy interval by a long gap and
+	// understate the rate. A new session starts without a baseline instead.
+	const h = makeHarness(testConfig());
+	await h.start();
+	h.box.ioMeasure = "device-busy";
+	await h.prompt();
+	assert.ok(h.calls.ioArgs[0].previous === null, "the first sample of a session has nothing to difference");
+
+	await h.stop();
+	await h.start();
+	await h.prompt();
+
+	const firstOfSecondSession = h.calls.ioArgs.at(-1);
+	assert.equal(firstOfSecondSession?.previous, null, "a new session must not difference against a closed one");
+	assert.equal(firstOfSecondSession?.elapsedMs, 0, "and must not carry the idle gap between them");
 	await h.stop();
 });
