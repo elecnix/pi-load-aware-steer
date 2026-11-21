@@ -60,6 +60,8 @@ type State = {
 	swapBand: Band;
 	ioBand: Band;
 	cpus: number;
+	/** Wall clock of the last sample, so a rate can be computed from two. */
+	lastSampleAt: number | null;
 	/** One-shot guards so a broken sensor reports once per session, not per boundary. */
 	loadUnavailableNotified: boolean;
 	memoryUnavailableNotified: boolean;
@@ -80,6 +82,7 @@ function makeState(): State {
 		swapBand: "normal",
 		ioBand: "normal",
 		cpus: cpuCount(),
+		lastSampleAt: null,
 		loadUnavailableNotified: false,
 		memoryUnavailableNotified: false,
 		swapUnavailableNotified: false,
@@ -128,9 +131,20 @@ function swapSentence(sample: SwapSample): string {
 	);
 }
 
-/** I/O line body. The `full` share is named only when the kernel reported it. */
+/**
+ * I/O line body.
+ *
+ * The two platforms measure different things and the sentence says which. On
+ * Linux the figure is the share of wall time a task was stalled, plus the
+ * share where every task was. On macOS it is the share of wall time the disks
+ * spent with a request outstanding, which is not a stall and is not described
+ * as one.
+ */
 function ioSentence(sample: IoPressureSample): string {
 	const some = (sample.some10 * 100).toFixed(1);
+	if (sample.measure === "device-busy") {
+		return `Disk busy: ${some}% of wall time with a disk handling a request`;
+	}
 	const full =
 		sample.full10 === null
 			? ""
@@ -176,6 +190,23 @@ function formatCombinedReport(
 	return lines.join("\n");
 }
 
+/**
+ * Report a diagnostic to whoever can act on it.
+ *
+ * While pi owns the terminal it renders a full-screen frame, and a raw
+ * `console.error` writes into that frame instead of into a log the reader can
+ * scroll: the text lands over the interface and scrolls away with the next
+ * repaint. So the UI carries the message when there is a UI, and stderr is the
+ * fallback for a headless run, where nothing is drawing.
+ */
+function diagnose(ctx: ExtensionContext, message: string): void {
+	if (ctx.hasUI) {
+		ctx.ui.notify(`load-aware-steer: ${message}`, "warning");
+		return;
+	}
+	console.error(`[load-aware-steer] ${message}`);
+}
+
 /** Keep the footer status current. Presentation only, no thresholds implied. */
 function updateStatus(ctx: ExtensionContext, state: State): void {
 	if (!ctx.hasUI) return;
@@ -187,17 +218,27 @@ function updateStatus(ctx: ExtensionContext, state: State): void {
 		: state.swap.totalBytes === 0
 			? "none"
 			: `${(state.swap.usedFraction * 100).toFixed(0)}%`;
-	const io = state.io?.available ? `${(state.io.some10 * 100).toFixed(0)}%` : "—";
+	const io = state.io?.available
+		? `${(state.io.some10 * 100).toFixed(0)}%`
+		: state.io?.source === "iokit-device-busy"
+			? "…"
+			: "—";
 	const label = `load ${load}/${state.cpus} · mem ${memory} · swap ${swap} · io ${io}`;
 
-	const bands: Band[] = [state.loadBand, state.memoryBand, state.swapBand, state.ioBand];
-	const worst: Band = bands.includes("high") ? "high" : bands.includes("elevated") ? "elevated" : "normal";
-	const painted =
-		worst === "high"
-			? theme?.fg("error", label)
-			: worst === "elevated"
-				? theme?.fg("warning", label)
-				: theme?.fg("dim", label);
+	// The footer is a status line, not an alarm: it stays muted and only takes a
+	// colour when load is above one runnable thread per CPU, or swap is past its
+	// threshold. Memory never colours it, because a warm page cache is the
+	// normal state of a working machine, not a fault.
+	const config = state.config;
+	const loadAbove = state.load?.available === true && config != null && state.load.load1 > config.loadThreshold;
+	const swapAbove =
+		state.swap?.available === true &&
+		state.swap.totalBytes > 0 &&
+		config != null &&
+		state.swap.usedFraction > config.swapThreshold;
+	const underPressure = loadAbove || swapAbove;
+
+	const painted = underPressure ? theme?.fg("warning", label) : theme?.fg("dim", label);
 
 	ctx.ui.setStatus(STATUS_KEY, painted ?? label);
 }
@@ -207,7 +248,10 @@ export type SteerDeps = {
 	readLoadImpl?: () => Promise<LoadSample>;
 	readMemoryImpl?: () => Promise<MemorySample>;
 	readSwapImpl?: () => Promise<SwapSample>;
-	readIoPressureImpl?: () => Promise<IoPressureSample>;
+	readIoPressureImpl?: (options: {
+		previous: IoPressureSample | null;
+		elapsedMs: number;
+	}) => Promise<IoPressureSample>;
 	loadConfigImpl?: typeof loadConfig;
 	cpuCountImpl?: () => number;
 };
@@ -241,11 +285,18 @@ async function sampleAndReport(
 	const config = state.config;
 	if (!config) return null;
 
+	// A rate needs two readings, so the reader is handed the previous sample
+	// and the wall time since it. macOS gets its disk figure this way; the
+	// other platforms ignore both.
+	const now = Date.now();
+	const elapsedMs = state.lastSampleAt === null ? 0 : now - state.lastSampleAt;
+	state.lastSampleAt = now;
+
 	const [load, memory, swap, io] = await Promise.all([
 		deps.readLoadImpl(),
 		deps.readMemoryImpl(),
 		deps.readSwapImpl(),
-		deps.readIoPressureImpl(),
+		deps.readIoPressureImpl({ previous: state.io, elapsedMs }),
 	]);
 	state.load = load;
 	state.memory = memory;
@@ -254,26 +305,25 @@ async function sampleAndReport(
 
 	// An unavailable sensor is surfaced where the user can see it, once, and
 	// its band holds until the sensor returns. A machine with no swap is not
-	// unavailable: the reader reports the absence as a reading.
+	// unavailable: the reader reports the absence as a reading. Neither is a
+	// platform that has no such sensor at all, nor a first reading waiting for
+	// its second: `unavailable` is reserved for a source that should have
+	// answered and did not.
 	if (!load.available && !state.loadUnavailableNotified) {
 		state.loadUnavailableNotified = true;
-		if (ctx.hasUI) ctx.ui.notify(`load-aware-steer: load average unavailable (${load.detail}).`, "warning");
-		console.error(`[load-aware-steer] load unavailable: ${load.detail}`);
+		diagnose(ctx, `load average unavailable (${load.detail}).`);
 	}
 	if (!memory.available && !state.memoryUnavailableNotified) {
 		state.memoryUnavailableNotified = true;
-		if (ctx.hasUI) ctx.ui.notify(`load-aware-steer: memory unavailable (${memory.detail}).`, "warning");
-		console.error(`[load-aware-steer] memory unavailable: ${memory.detail}`);
+		diagnose(ctx, `memory unavailable (${memory.detail}).`);
 	}
 	if (!swap.available && !state.swapUnavailableNotified) {
 		state.swapUnavailableNotified = true;
-		if (ctx.hasUI) ctx.ui.notify(`load-aware-steer: swap unavailable (${swap.detail}).`, "warning");
-		console.error(`[load-aware-steer] swap unavailable: ${swap.detail}`);
+		diagnose(ctx, `swap unavailable (${swap.detail}).`);
 	}
-	if (!io.available && !state.ioUnavailableNotified) {
+	if (!io.available && io.source === "unavailable" && !state.ioUnavailableNotified) {
 		state.ioUnavailableNotified = true;
-		if (ctx.hasUI) ctx.ui.notify(`load-aware-steer: I/O pressure unavailable (${io.detail}).`, "warning");
-		console.error(`[load-aware-steer] I/O pressure unavailable: ${io.detail}`);
+		diagnose(ctx, `I/O pressure unavailable (${io.detail}).`);
 	}
 
 	updateStatus(ctx, state);
@@ -398,6 +448,12 @@ export default function loadAwareSteer(pi: ExtensionAPI, deps: SteerDeps = {}): 
 		state.memoryUnavailableNotified = false;
 		state.swapUnavailableNotified = false;
 		state.ioUnavailableNotified = false;
+		// A rate is measured between two samples of one session. The I/O figure
+		// differences a cumulative counter, so carrying either the counter or the
+		// clock across a session boundary would divide a short interval of work by
+		// however long the process sat idle in between.
+		state.io = null;
+		state.lastSampleAt = null;
 		state.cpus = resolved.cpuCountImpl();
 		state.config = await resolved.loadConfigImpl();
 
@@ -423,5 +479,7 @@ export default function loadAwareSteer(pi: ExtensionAPI, deps: SteerDeps = {}): 
 		state.memoryBand = "normal";
 		state.swapBand = "normal";
 		state.ioBand = "normal";
+		state.io = null;
+		state.lastSampleAt = null;
 	});
 }

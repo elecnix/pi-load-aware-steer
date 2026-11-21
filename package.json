@@ -21,7 +21,7 @@
   },
   "scripts": {
     "check": "tsc --noEmit",
-    "test": "node --test test/signals.test.ts test/load.test.ts test/memory.test.ts test/swap.test.ts test/io.test.ts test/config.test.ts test/extension.test.ts"
+    "test": "node --test test/signals.test.ts test/load.test.ts test/memory.test.ts test/swap.test.ts test/io.test.ts test/config.test.ts test/extension.test.ts test/host.test.ts"
   },
   "pi": {
     "extensions": [
