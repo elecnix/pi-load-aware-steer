@@ -22,7 +22,7 @@ import loadAwareSteer, { type SteerDeps } from "../index.ts";
 import type { LoadSample } from "../src/load.ts";
 import type { MemorySample } from "../src/memory.ts";
 import type { SwapSample } from "../src/swap.ts";
-import type { IoPressureSample } from "../src/io.ts";
+import type { IoMeasure, IoPressureSample } from "../src/io.ts";
 import type { SteerConfig } from "../src/config.ts";
 
 const GIB = 1024 ** 3;
@@ -87,7 +87,30 @@ function unsupportedIo(): IoPressureSample {
 		some10: 0,
 		full10: null,
 		source: "unsupported",
-		detail: "no pressure stall accounting on darwin",
+		detail: "no disk pressure accounting on win32",
+	};
+}
+
+function warmingBusyIo(): IoPressureSample {
+	return {
+		available: false,
+		some10: 0,
+		full10: null,
+		source: "iokit-device-busy",
+		measure: "device-busy",
+		cumulativeBusyNs: 1_000_000_000,
+		detail: "a second reading is required for a rate",
+	};
+}
+
+function busyIoSample(share: number): IoPressureSample {
+	return {
+		available: true,
+		some10: share,
+		full10: null,
+		source: "iokit-device-busy",
+		measure: "device-busy",
+		cumulativeBusyNs: 2_000_000_000,
 	};
 }
 
@@ -133,6 +156,8 @@ function makeHarness(config: SteerConfig) {
 		io: 0.05,
 		ioAvailable: true,
 		ioUnsupported: false,
+		ioWarming: false,
+		ioMeasure: "stall" as IoMeasure,
 		hasUI: true,
 	};
 	const calls = { load: 0, memory: 0, swap: 0, io: 0 };
@@ -154,7 +179,9 @@ function makeHarness(config: SteerConfig) {
 		readIoPressureImpl: async () => {
 			calls.io++;
 			if (box.ioUnsupported) return unsupportedIo();
-			return box.ioAvailable ? ioSample(box.io) : unavailableIo();
+			if (box.ioWarming) return warmingBusyIo();
+			if (!box.ioAvailable) return unavailableIo();
+			return box.ioMeasure === "device-busy" ? busyIoSample(box.io) : ioSample(box.io);
 		},
 		loadConfigImpl: async () => config,
 		cpuCountImpl: () => 10,
@@ -174,12 +201,19 @@ function makeHarness(config: SteerConfig) {
 		},
 	};
 
+	const statusColors: string[] = [];
+
 	const ctx = {
 		get hasUI() {
 			return box.hasUI;
 		},
 		ui: {
-			theme: { fg: (_color: string, text: string) => text },
+			theme: {
+				fg: (color: string, text: string) => {
+					statusColors.push(color);
+					return text;
+				},
+			},
 			setStatus(key: string, value: unknown) {
 				statuses.push({ key, value });
 			},
@@ -243,6 +277,7 @@ function makeHarness(config: SteerConfig) {
 		statuses,
 		notifications,
 		registeredCommands,
+		statusColors,
 		handlers,
 		start,
 		stop,
@@ -605,12 +640,13 @@ test("a dead swap or I/O sensor holds its band and is surfaced once", async () =
 	await h.stop();
 });
 
-test("a platform with no I/O stall accounting says nothing at all", async () => {
+test("a platform with no I/O accounting says nothing at all", async () => {
 	const h = makeHarness(testConfig());
 	await h.start();
 
-	// macOS and Windows have no PSI. That is a known absence, not a fault, so
-	// it must not warn, must not move a band, and must not claim a reading.
+	// Windows and the BSDs publish nothing to read. That is a known absence, not
+	// a fault, so it must not warn, must not move a band, and must not claim a
+	// reading.
 	h.box.ioAvailable = false;
 	h.box.ioUnsupported = true;
 	assert.equal((await h.prompt())?.message, undefined, "an unsupported signal carries no line");
@@ -624,6 +660,34 @@ test("a platform with no I/O stall accounting says nothing at all", async () => 
 	// The same absence on the next sample stays silent too.
 	assert.equal((await h.prompt())?.message, undefined);
 	assert.equal(h.notifications.length, 0);
+	await h.stop();
+});
+
+test("the first macOS reading waits for its second, silently", async () => {
+	const h = makeHarness(testConfig());
+	await h.start();
+
+	// macOS measures disk busy time by differencing two readings. The first one
+	// establishes the baseline, and waiting for a rate is not a fault.
+	h.box.ioAvailable = false;
+	h.box.ioWarming = true;
+	assert.equal((await h.prompt())?.message, undefined);
+	assert.deepEqual(h.notifications, [], "a pending baseline is not a sensor failure");
+	assert.match(String(h.statuses.at(-1)?.value), /io …/, "the footer says the figure is pending");
+	await h.stop();
+});
+
+test("a macOS disk busy figure is described as busy time, never as a stall", async () => {
+	const h = makeHarness(testConfig());
+	await h.start();
+
+	// 25% busy clears the 20% threshold, and the sentence must say what it is.
+	h.box.ioMeasure = "device-busy";
+	h.box.io = 0.25;
+	const text = (await h.prompt())?.message?.content ?? "";
+
+	assert.match(text, /Disk busy: 25\.0% of wall time with a disk handling a request\. Band normal -> elevated\./);
+	assert.equal(/stalled on I\/O/.test(text), false, "busy time is not stall time");
 	await h.stop();
 });
 
@@ -777,5 +841,70 @@ test("shutdown clears the status line and a new session starts from normal", asy
 		/Band normal -> elevated/,
 		"a new session reports the current band again",
 	);
+	await h.stop();
+});
+
+test("the footer stays muted while load and swap are under their thresholds", async () => {
+	// The footer is a status line, not an alarm. A warm machine with a warm page
+	// cache is the normal state, so it earns no colour.
+	const h = makeHarness(testConfig());
+	await h.start();
+
+	h.box.load1 = 1.5; // well under the 4.0 threshold
+	h.box.memory = 0.75; // under 80%
+	h.box.swap = 0.3; // under 50%
+	await h.prompt();
+
+	assert.equal(h.statusColors.at(-1), "dim", "nothing is above its threshold, so the line is muted");
+	await h.stop();
+});
+
+test("the footer takes a colour when load is above one thread per CPU", async () => {
+	const h = makeHarness(testConfig());
+	await h.start();
+
+	h.box.load1 = 4.2; // over the 4.0 threshold
+	await h.prompt();
+
+	assert.equal(h.statusColors.at(-1), "warning");
+	await h.stop();
+});
+
+test("the footer takes a colour when swap is past its threshold", async () => {
+	const h = makeHarness(testConfig());
+	await h.start();
+
+	h.box.swap = 0.62; // over the 50% threshold
+	await h.prompt();
+
+	assert.equal(h.statusColors.at(-1), "warning");
+	await h.stop();
+});
+
+test("memory alone never colours the footer", async () => {
+	// A warm page cache is how a working machine looks, and a red status line
+	// on every turn teaches the reader to ignore it.
+	const h = makeHarness(testConfig());
+	await h.start();
+
+	h.box.memory = 0.95; // past the 80% threshold
+	await h.prompt();
+
+	assert.equal(h.statusColors.at(-1), "dim");
+	await h.stop();
+});
+
+test("the footer never uses the error colour", async () => {
+	const h = makeHarness(testConfig());
+	await h.start();
+
+	// Saturate every signal at once: still a status line, not an alarm.
+	h.box.load1 = 40;
+	h.box.memory = 0.99;
+	h.box.swap = 0.95;
+	h.box.io = 0.9;
+	await h.prompt();
+
+	assert.equal(h.statusColors.includes("error"), false, "error is reserved for something the reader can act on");
 	await h.stop();
 });

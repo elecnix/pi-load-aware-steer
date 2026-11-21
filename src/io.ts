@@ -29,25 +29,44 @@
  */
 
 import { readFile } from "node:fs/promises";
+import { execFile } from "node:child_process";
+import { promisify } from "node:util";
+
+const execFileAsync = promisify(execFile);
 
 /**
- * `unsupported` marks an expected platform absence — macOS and Windows have no
- * pressure stall accounting — and is distinct from `unavailable`, which marks
- * a Linux machine whose PSI source cannot be read. Callers surface a dead
+ * `unsupported` marks an expected platform absence — a system that publishes no
+ * such accounting at all — and is distinct from `unavailable`, which marks a
+ * machine that has the source and cannot read it. Callers surface a dead
  * sensor; a missing feature is not a fault.
+ *
+ * `iokit-device-busy` marks macOS, where the figure is derived from IOKit's
+ * own per-device busy time rather than from PSI. The two quantities are not the
+ * same and the sample says which one it carries: PSI counts wall time in which
+ * a task was stalled, IOKit counts wall time in which a disk had a request
+ * outstanding, which a queueing device reports long before anything waits.
  */
-export type IoPressureSource = "/proc/pressure/io" | "unavailable" | "unsupported";
+export type IoPressureSource = "/proc/pressure/io" | "iokit-device-busy" | "unavailable" | "unsupported";
+
+/** Which quantity `some10` carries. Never present one as the other. */
+export type IoMeasure = "stall" | "device-busy";
 
 export type IoPressureSample = {
 	/** False when no source could produce usable numbers. Never guess a value. */
 	available: boolean;
-	/** `some avg10` as a fraction of wall time: at least one task stalled on I/O. */
+	/** The measured share of wall time, as a fraction. PSI `some avg10` on Linux;
+	 *  aggregate disk busy time on macOS. `measure` says which. */
 	some10: number;
 	/** `full avg10` as a fraction, or null when the kernel did not report it. */
 	full10: number | null;
 	source: IoPressureSource;
 	/** Why the sample is unavailable. */
 	detail?: string;
+	/** The quantity `some10` carries, absent when there is no figure. */
+	measure?: IoMeasure;
+	/** Cumulative device busy nanoseconds, the baseline for the next sample's
+	 *  rate. Only macOS carries it, and it is never presented as a figure. */
+	cumulativeBusyNs?: number;
 };
 
 export type IoPressureReaderOptions = {
@@ -55,6 +74,12 @@ export type IoPressureReaderOptions = {
 	platform?: NodeJS.Platform;
 	/** Injected for tests. Defaults to fs.readFile(path, "utf8"). */
 	readFileImpl?: (path: string) => Promise<string>;
+	/** Injected for tests. Defaults to running the command. */
+	execFileImpl?: (file: string, args: string[]) => Promise<string>;
+	/** The previous sample, when a rate needs two readings. */
+	previous?: IoPressureSample | null;
+	/** Milliseconds between the previous sample and this one. */
+	elapsedMs?: number;
 };
 
 /** One `some` or `full` line of a PSI file. Averages are percentages, so
@@ -98,13 +123,104 @@ function unsupported(detail: string): IoPressureSample {
 }
 
 /**
- * Read disk I/O pressure. Never throws: a missing or unreadable PSI file is
+ * Sum the device busy time IOKit reports, in nanoseconds.
+ *
+ * `ioreg -c IOBlockStorageDriver` prints one `Statistics` dictionary per disk,
+ * each holding cumulative `Total Time (Read)` and `Total Time (Write)`. Those
+ * are nanoseconds the device spent with a request in flight, so differencing
+ * two readings over a known wall interval gives the share of that interval the
+ * machine's disks were busy. Returns null when no dictionary carries the
+ * fields, which means the driver layout is not what this parser knows.
+ */
+export function parseIokitBusyNs(output: string): number | null {
+	let total = 0;
+	let found = false;
+	for (const block of output.matchAll(/"Statistics" = \{([^}]*)\}/g)) {
+		const body = block[1];
+		const ns = (key: string): number | null => {
+			const match = new RegExp(`"${key}"=(\\d+)`).exec(body);
+			if (!match) return null;
+			const value = Number(match[1]);
+			return Number.isFinite(value) ? value : null;
+		};
+		const readNs = ns("Total Time \\(Read\\)");
+		const writeNs = ns("Total Time \\(Write\\)");
+		if (readNs === null && writeNs === null) continue;
+		found = true;
+		total += (readNs ?? 0) + (writeNs ?? 0);
+	}
+	return found ? total : null;
+}
+
+/**
+ * Disk busy share on macOS, from IOKit's per-device accounting.
+ *
+ * macOS has no PSI, so there is no stall figure to read. What the kernel does
+ * publish is how long each disk held an outstanding request, which is a real
+ * measurement of the same quantity Linux calls `%util`. It is reported as
+ * `device-busy` and never confused with a stall: a queueing device is busy
+ * before anything waits on it.
+ *
+ * A rate needs two readings, so the first sample of a session stores its
+ * baseline and returns no figure. Every later sample differences against it.
+ */
+async function darwinBusy(options: IoPressureReaderOptions): Promise<IoPressureSample> {
+	const run = options.execFileImpl ?? (async (file: string, args: string[]) => {
+		const { stdout } = await execFileAsync(file, args, { timeout: 2000 });
+		return stdout;
+	});
+
+	let busyNs: number | null;
+	try {
+		busyNs = parseIokitBusyNs(await run("ioreg", ["-r", "-c", "IOBlockStorageDriver", "-k", "Statistics", "-l"]));
+	} catch (error) {
+		return unavailable(`ioreg unavailable: ${(error as Error).message}`);
+	}
+	if (busyNs === null) return unavailable("ioreg reported no disk busy time");
+
+	const previous = options.previous;
+	const elapsedMs = options.elapsedMs ?? 0;
+	const hasBaseline =
+		previous != null &&
+		previous.source === "iokit-device-busy" &&
+		typeof previous.cumulativeBusyNs === "number" &&
+		elapsedMs > 0;
+
+	if (!hasBaseline) {
+		return {
+			available: false,
+			some10: 0,
+			full10: null,
+			source: "iokit-device-busy",
+			measure: "device-busy",
+			cumulativeBusyNs: busyNs,
+			detail: "a second reading is required for a rate",
+		};
+	}
+
+	const elapsedNs = elapsedMs * 1_000_000;
+	const busy = (busyNs - (previous.cumulativeBusyNs as number)) / elapsedNs;
+	return {
+		available: true,
+		// Disks can overlap, so the aggregate can exceed the wall interval.
+		// A share above 1 means every disk busy at once, which is saturated.
+		some10: Math.min(1, Math.max(0, busy)),
+		full10: null,
+		source: "iokit-device-busy",
+		measure: "device-busy",
+		cumulativeBusyNs: busyNs,
+	};
+}
+
+/**
+ * Read disk I/O pressure. Never throws: a missing or unreadable source is
  * reported as `available: false` so callers can stay quiet rather than guess.
  */
 export async function readIoPressure(options: IoPressureReaderOptions = {}): Promise<IoPressureSample> {
 	const platform = options.platform ?? process.platform;
+	if (platform === "darwin") return darwinBusy(options);
 	if (platform !== "linux") {
-		return unsupported(`no pressure stall accounting on ${platform}`);
+		return unsupported(`no disk pressure accounting on ${platform}`);
 	}
 
 	const read = options.readFileImpl ?? ((path: string) => readFile(path, "utf8"));
@@ -116,6 +232,7 @@ export async function readIoPressure(options: IoPressureReaderOptions = {}): Pro
 			some10: parsed.some.avg10 / 100,
 			full10: parsed.full ? parsed.full.avg10 / 100 : null,
 			source: "/proc/pressure/io",
+			measure: "stall",
 		};
 	} catch (error) {
 		return unavailable(`/proc/pressure/io unavailable: ${(error as Error).message}`);

@@ -33,6 +33,12 @@ Swap: 13.9 GiB of 16.0 GiB in use (87%). Band normal -> high.
 I/O pressure: 10.2% of wall time with at least one task stalled on I/O, 1.3% of wall time with every task stalled on I/O, band normal.
 ```
 
+On macOS the same message carries the busy-time figure instead, because that is what the machine can measure:
+
+```
+Disk busy: 10.2% of wall time with a disk handling a request, band normal.
+```
+
 A footer status line shows the current figures continuously between crossings, for example `load 2.14/10 · mem 61% · swap 13% · io 5%`.
 
 ## Install
@@ -82,7 +88,8 @@ With `enabled: false` the extension still samples at the boundaries and still up
 - Memory figures follow each platform's own accounting of memory in use, because `os.freemem()` on its own counts reclaimable page cache as in use and reports near-saturation on a machine with a warm cache. On macOS the reader parses `vm_stat` and adds anonymous, wired and compressed pages, which is the total Activity Monitor shows. On Linux it reads `/proc/meminfo` and subtracts `MemAvailable` from `MemTotal`. Everywhere else, and whenever either source fails, it falls back to `os.totalmem() - os.freemem()`. The `source` field on a sample records which path produced the number, and `LOAD_AWARE_STEER_DEBUG=1` logs a fallback to stderr.
 - Swap follows the platform too: `/proc/meminfo` on Linux and `sysctl vm.swapusage` on macOS. A machine with no swap reports `none configured` rather than a percentage of nothing, and a source that cannot be read reports unavailable rather than zero.
 - Swap usage is a fill level, not a rate. It does not fall on its own, so a machine that filled its swap once holds the band while the pages stay there, whether or not it is paging now. The I/O pressure line is the moving figure beside it; swap says how much backing store is committed.
-- I/O pressure comes from PSI, which is Linux-only. macOS and Windows publish no equivalent, and the extension treats that as an expected absence rather than a fault: it reports `unsupported` once, silently, and the footer shows `—` for the signal. It never substitutes `%util` or `iowait`, because a device can be busy, or the CPU counted as waiting, without any task being stalled, and the reverse. On Linux, a kernel built without PSI, or a `/proc/pressure/io` that cannot be read, is a different case: that machine has the source and lost it, so the fault is reported.
+- I/O is measured differently on each platform, and the message says which. Linux reads PSI, which is the share of wall time a task spent stalled. macOS has no PSI, so there the figure is IOKit's own per-disk busy time, differenced between samples and reported as `Disk busy`, the share of wall time a disk had a request outstanding. The two are not interchangeable: a queueing disk is busy well before anything waits on it. Neither platform ever substitutes throughput, `%util` or `iowait`, because a number for a different question reads as an answer. A Linux kernel built without PSI, or an unreadable `/proc/pressure/io`, is a fault and is reported; a platform that publishes nothing at all is not.
+- The footer status line stays muted, and takes the warning colour only when load is above one runnable thread per CPU or swap is past its threshold. It never uses the error colour. Memory never colours it, because a warm page cache is how a working machine looks.
 - A diagnostic reaches a person through the pi UI when one is attached, and through stderr only in a headless run. Writing to the console while pi owns the terminal paints the text over the rendered frame, where it smears the interface and scrolls away, so the extension does not do it.
 - Load average counts runnable and uninterruptible threads, so heavy disk I/O raises it even when the CPUs are idle.
 - A value oscillating across a band boundary produces one message per crossing. Raise `hysteresis` to reduce the rate.

@@ -69,8 +69,11 @@ test("the host's own platform never turns a missing sensor into a complaint", as
 
 		// The other signals must still produce a footer on this host.
 		assert.match(String(statuses.at(-1)), /load .*mem .*swap/);
-		if (process.platform !== "linux") {
-			assert.match(String(statuses.at(-1)), /io —/, "an unsupported signal shows no figure");
+		if (process.platform === "darwin") {
+			// The first reading only establishes the baseline for the rate.
+			assert.match(String(statuses.at(-1)), /io …/, "macOS says the figure is pending, not that it is broken");
+		} else if (process.platform !== "linux") {
+			assert.match(String(statuses.at(-1)), /io —/, "a platform with no source shows no figure");
 		}
 	} finally {
 		console.error = original.error;

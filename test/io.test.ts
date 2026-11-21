@@ -1,19 +1,18 @@
 /**
- * The disk I/O contention reader.
+ * The disk I/O reader.
  *
- * The measure is PSI stall share, and the tests pin the two things that make
- * it trustworthy: a missing `some` line is unavailable rather than zero, and
- * the percentages become fractions in [0, 1] without arithmetic surprises.
- *
- * PSI is Linux-only, so the unsupported-platform case is a first-class path
- * here rather than an afterthought: a reader that invented a number from
- * `%util` or `iowait` would be answering a different question.
+ * Linux reads PSI stall share; macOS differences IOKit's cumulative device busy
+ * time. The tests pin what makes either trustworthy: a missing source is never
+ * zero, a first reading that cannot yet yield a rate says so rather than
+ * reporting one, and a busy share is clamped instead of exceeding the wall
+ * interval. The two measures stay labelled apart, because a disk can be busy
+ * without anything waiting on it.
  */
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-import { readIoPressure, parsePressure } from "../src/io.ts";
+import { readIoPressure, parsePressure, parseIokitBusyNs } from "../src/io.ts";
 
 const PSI = `some avg10=10.61 avg60=11.47 avg300=11.59 total=176015945404
 full avg10=2.77 avg60=3.18 avg300=3.02 total=134160934492
@@ -82,13 +81,86 @@ test("Linux reports unavailable when the file has no some line", async () => {
 	assert.equal(sample.some10, 0, "unavailable is not a stall reading");
 });
 
-test("a platform without pressure stall accounting reports unsupported, not unavailable", async () => {
-	for (const platform of ["darwin", "win32"] as const) {
+test("a platform with no disk accounting at all reports unsupported, not unavailable", async () => {
+	for (const platform of ["win32", "freebsd"] as const) {
 		const sample = await readIoPressure({ platform });
-		assert.equal(sample.available, false, `${platform} has no PSI`);
+		assert.equal(sample.available, false, `${platform} publishes nothing to read`);
 		assert.equal(sample.source, "unsupported", `${platform} is an expected absence, not a dead sensor`);
 		assert.match(String(sample.detail), new RegExp(platform));
 	}
+});
+
+const IOREG_TWO_DISKS = `
++-o IOBlockStorageDriver  <class IOBlockStorageDriver, id 0x1>
+    {
+      "Statistics" = {"Operations (Write)"=0,"Bytes (Read)"=0,"Total Time (Read)"=0,"Total Time (Write)"=0,"Operations (Read)"=0}
+    }
+
++-o IOBlockStorageDriver  <class IOBlockStorageDriver, id 0x2>
+  | {
+  |   "Statistics" = {"Operations (Write)"=966286501,"Bytes (Read)"=33771576930304,"Total Time (Read)"=220547731120675,"Total Time (Write)"=39516323123361,"Operations (Read)"=1616322303}
+  | }
+`;
+
+test("IOKit busy time is summed across every disk that reports it", () => {
+	assert.equal(parseIokitBusyNs(IOREG_TWO_DISKS), 220547731120675 + 39516323123361);
+});
+
+test("an IOKit output with no statistics block yields null rather than zero", () => {
+	assert.equal(parseIokitBusyNs("+-o IOBlockStorageDriver\n  | {\n  | }\n"), null);
+});
+
+test("macOS needs a second reading before it can report a rate", async () => {
+	const sample = await readIoPressure({
+		platform: "darwin",
+		execFileImpl: async () => IOREG_TWO_DISKS,
+	});
+	assert.equal(sample.available, false, "one reading gives no interval to divide by");
+	assert.equal(sample.source, "iokit-device-busy");
+	assert.equal(sample.measure, "device-busy");
+	assert.equal(sample.cumulativeBusyNs, 220547731120675 + 39516323123361, "the baseline is kept for next time");
+	assert.match(String(sample.detail), /second reading/);
+});
+
+test("macOS reports disk busy time as a share of the interval between readings", async () => {
+	const first = await readIoPressure({ platform: "darwin", execFileImpl: async () => IOREG_TWO_DISKS });
+	// 250 ms of additional device busy time over a one-second interval.
+	const advanced = IOREG_TWO_DISKS.replace(/220547731120675/g, String(220547731120675 + 250_000_000));
+	const second = await readIoPressure({
+		platform: "darwin",
+		execFileImpl: async () => advanced,
+		previous: first,
+		elapsedMs: 1000,
+	});
+	assert.equal(second.available, true);
+	assert.equal(second.source, "iokit-device-busy");
+	assert.equal(second.measure, "device-busy", "the figure is busy time, never presented as a stall");
+	assert.equal(Number(second.some10.toFixed(3)), 0.25);
+	assert.equal(second.full10, null, "macOS publishes no every-task-stalled figure");
+});
+
+test("overlapping disks clamp the busy share instead of exceeding the interval", async () => {
+	const first = await readIoPressure({ platform: "darwin", execFileImpl: async () => IOREG_TWO_DISKS });
+	const advanced = IOREG_TWO_DISKS.replace(/220547731120675/g, String(220547731120675 + 2_000_000_000));
+	const second = await readIoPressure({
+		platform: "darwin",
+		execFileImpl: async () => advanced,
+		previous: first,
+		elapsedMs: 1000,
+	});
+	assert.equal(second.some10, 1, "two seconds of busy time in one second is saturation, not 200%");
+});
+
+test("macOS reports unavailable when ioreg itself fails, because that is a fault", async () => {
+	const sample = await readIoPressure({
+		platform: "darwin",
+		execFileImpl: async () => {
+			throw new Error("ioreg not found");
+		},
+	});
+	assert.equal(sample.available, false);
+	assert.equal(sample.source, "unavailable");
+	assert.match(String(sample.detail), /ioreg/);
 });
 
 test("Linux keeps reporting unavailable when the PSI source cannot be read", async () => {
@@ -101,13 +173,13 @@ test("Linux keeps reporting unavailable when the PSI source cannot be read", asy
 	assert.equal(sample.source, "unavailable", "a readable platform with an unreadable source is a fault");
 });
 
-test("a real reading on Linux is available and bounded", async () => {
+test("a real reading on this host is available and bounded", async () => {
 	const sample = await readIoPressure();
 	if (!sample.available) {
-		// On a host with no PSI the reader must name its reason rather than
-		// presenting zeros as a measurement.
+		// A first macOS reading waits for its second; a host with no source says
+		// so. Neither may present zeros as a measurement.
 		assert.ok(
-			sample.source === "unsupported" || sample.source === "unavailable",
+			["unsupported", "unavailable", "iokit-device-busy"].includes(sample.source),
 			`an unavailable sample names why: ${sample.source}`,
 		);
 		assert.ok(sample.detail);
