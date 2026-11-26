@@ -28,6 +28,9 @@ export type SteerConfig = BandConfig & {
 	ioThreshold: number;
 	/** Master switch. When false the extension samples and shows a status line but announces nothing. */
 	enabled: boolean;
+	/** Shortest wall time between two messages, in milliseconds. A band that
+	 *  moves and comes back inside this window is reported not at all. */
+	minReportIntervalMs: number;
 	loadThresholdSource: ThresholdSource;
 	memoryThresholdSource: ThresholdSource;
 	swapThresholdSource: ThresholdSource;
@@ -61,6 +64,10 @@ export const DEFAULTS = {
 	/** 20% of wall time with at least one task stalled on I/O. */
 	ioPressureThresholdPercent: 20,
 	enabled: true,
+	/** Five minutes between messages. A machine under load passes through two
+	 *  bands a minute; reporting each step tells the reader nothing the next
+	 *  message does not, and buries the work it was meant to accompany. */
+	minReportIntervalSeconds: 300,
 } as const;
 
 function numberFrom(value: string | undefined): number | undefined {
@@ -166,6 +173,18 @@ export async function loadConfig(options: LoadConfigOptions = {}): Promise<Steer
 
 	const enabled = boolFrom(env.LOAD_AWARE_STEER_ENABLED) ?? fileBool("enabled") ?? DEFAULTS.enabled;
 
+	// The interval is configured in seconds because that is how a person states
+	// it, and compared in milliseconds because that is what the clock returns.
+	// Zero is accepted and means every crossing is reported.
+	const minIntervalNumber = numberFrom(env.LOAD_AWARE_STEER_MIN_INTERVAL) ?? fileNumber("minReportIntervalSeconds");
+	let minReportIntervalSeconds = minIntervalNumber ?? DEFAULTS.minReportIntervalSeconds;
+	if (minIntervalNumber !== undefined && minIntervalNumber < 0) {
+		warnings.push(
+			`minReportIntervalSeconds ${minIntervalNumber} is negative; using default ${DEFAULTS.minReportIntervalSeconds}`,
+		);
+		minReportIntervalSeconds = DEFAULTS.minReportIntervalSeconds;
+	}
+
 	const swap = fractionThreshold(
 		env.LOAD_AWARE_STEER_SWAP_THRESHOLD,
 		"swapThresholdPercent",
@@ -189,6 +208,7 @@ export async function loadConfig(options: LoadConfigOptions = {}): Promise<Steer
 		ioThreshold: io.value,
 		ioThresholdSource: io.source,
 		enabled,
+		minReportIntervalMs: minReportIntervalSeconds * 1000,
 		warnings,
 		elevatedMultiplier: DEFAULT_BAND_CONFIG.elevatedMultiplier,
 		highMultiplier: DEFAULT_BAND_CONFIG.highMultiplier,

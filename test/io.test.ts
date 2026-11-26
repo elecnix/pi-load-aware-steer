@@ -122,15 +122,52 @@ test("macOS needs a second reading before it can report a rate", async () => {
 	assert.match(String(sample.detail), /second reading/);
 });
 
-test("macOS reports disk busy time as a share of the interval between readings", async () => {
+test("a macOS reading less than ten seconds after its baseline holds the last figure", async () => {
+	// Tool turns end a second apart. A busy share over one second swings from a
+	// few percent to half the interval, so the reader averages over at least ten
+	// seconds, the same window as PSI avg10, and holds the last figure until then.
 	const first = await readIoPressure({ platform: "darwin", execFileImpl: async () => IOREG_TWO_DISKS });
-	// 250 ms of additional device busy time over a one-second interval.
-	const advanced = IOREG_TWO_DISKS.replace(/220547731120675/g, String(220547731120675 + 250_000_000));
-	const second = await readIoPressure({
+	const advanced = IOREG_TWO_DISKS.replace(/220547731120675/g, String(220547731120675 + 2_500_000_000));
+	const early = await readIoPressure({
 		platform: "darwin",
 		execFileImpl: async () => advanced,
 		previous: first,
 		elapsedMs: 1000,
+	});
+	assert.equal(early.available, false, "one second is too short a window for a figure");
+	assert.equal(early.source, "iokit-device-busy", "an open window is not a sensor fault");
+	assert.equal(early.cumulativeBusyNs, first.cumulativeBusyNs, "the baseline stays where the window opened");
+	assert.equal(early.windowElapsedMs, 1000);
+
+	const closed = await readIoPressure({
+		platform: "darwin",
+		execFileImpl: async () => advanced,
+		previous: early,
+		elapsedMs: 9000,
+	});
+	assert.equal(closed.available, true);
+	assert.equal(Number(closed.some10.toFixed(3)), 0.25, "2.5 s busy over the whole 10 s window");
+	assert.equal(closed.windowElapsedMs, 0, "a closed window opens the next one");
+
+	const held = await readIoPressure({
+		platform: "darwin",
+		execFileImpl: async () => IOREG_TWO_DISKS.replace(/220547731120675/g, String(220547731120675 + 9_000_000_000)),
+		previous: closed,
+		elapsedMs: 1000,
+	});
+	assert.equal(held.available, true);
+	assert.equal(held.some10, closed.some10, "inside the next window the last closed figure stands");
+});
+
+test("macOS reports disk busy time as a share of the interval between readings", async () => {
+	const first = await readIoPressure({ platform: "darwin", execFileImpl: async () => IOREG_TWO_DISKS });
+	// 2.5 s of additional device busy time over a ten-second interval.
+	const advanced = IOREG_TWO_DISKS.replace(/220547731120675/g, String(220547731120675 + 2_500_000_000));
+	const second = await readIoPressure({
+		platform: "darwin",
+		execFileImpl: async () => advanced,
+		previous: first,
+		elapsedMs: 10_000,
 	});
 	assert.equal(second.available, true);
 	assert.equal(second.source, "iokit-device-busy");
@@ -141,14 +178,14 @@ test("macOS reports disk busy time as a share of the interval between readings",
 
 test("overlapping disks clamp the busy share instead of exceeding the interval", async () => {
 	const first = await readIoPressure({ platform: "darwin", execFileImpl: async () => IOREG_TWO_DISKS });
-	const advanced = IOREG_TWO_DISKS.replace(/220547731120675/g, String(220547731120675 + 2_000_000_000));
+	const advanced = IOREG_TWO_DISKS.replace(/220547731120675/g, String(220547731120675 + 20_000_000_000));
 	const second = await readIoPressure({
 		platform: "darwin",
 		execFileImpl: async () => advanced,
 		previous: first,
-		elapsedMs: 1000,
+		elapsedMs: 10_000,
 	});
-	assert.equal(second.some10, 1, "two seconds of busy time in one second is saturation, not 200%");
+	assert.equal(second.some10, 1, "twenty seconds of busy time in ten seconds is saturation, not 200%");
 });
 
 test("macOS reports unavailable when ioreg itself fails, because that is a fault", async () => {

@@ -20,8 +20,11 @@
  * extensions appended, without setting `continue`.
  *
  * Band changes are reported in both directions, so a machine recovering is as
- * visible as one saturating. Hysteresis keeps a value hovering at a boundary
- * from producing a message at every sample.
+ * visible as one saturating. A message is sent at most once per configured
+ * interval, and it measures each signal against the band the reader was last
+ * told, so a value that crosses a boundary and comes back reports nothing.
+ * Hysteresis keeps a value hovering at one boundary from moving the band at
+ * every sample in the first place.
  *
  * Loaded via jiti, so TypeScript needs no build step.
  */
@@ -40,7 +43,7 @@ import { readMemory, type MemorySample } from "./src/memory.ts";
 import { readSwap, type SwapSample } from "./src/swap.ts";
 import { readIoPressure, type IoPressureSample } from "./src/io.ts";
 import { formatBytes } from "./src/format.ts";
-import { nextBand, isCrossing, type Band } from "./src/signals.ts";
+import { nextBand, type Band } from "./src/signals.ts";
 import { loadConfig, cpuCount, type SteerConfig } from "./src/config.ts";
 
 const STATUS_KEY = "load-aware-steer";
@@ -48,6 +51,11 @@ const MESSAGE_TYPE = "load-aware-steer.update";
 
 /** Identifies which of the watched signals a band belongs to. */
 type Signal = "load" | "memory" | "swap" | "io";
+
+const SIGNALS: readonly Signal[] = ["load", "memory", "swap", "io"];
+
+/** The band each signal is in, by signal name. */
+type Bands = Record<Signal, Band>;
 
 type State = {
 	config: SteerConfig | null;
@@ -59,6 +67,11 @@ type State = {
 	memoryBand: Band;
 	swapBand: Band;
 	ioBand: Band;
+	/** The band each signal was in when the last message was sent, which is
+	 *  what the next message measures its change against. */
+	reported: Bands;
+	/** Wall clock of the last message, so at most one is sent per interval. */
+	lastReportAt: number | null;
 	cpus: number;
 	/** Wall clock of the last sample, so a rate can be computed from two. */
 	lastSampleAt: number | null;
@@ -81,6 +94,8 @@ function makeState(): State {
 		memoryBand: "normal",
 		swapBand: "normal",
 		ioBand: "normal",
+		reported: { load: "normal", memory: "normal", swap: "normal", io: "normal" },
+		lastReportAt: null,
 		cpus: cpuCount(),
 		lastSampleAt: null,
 		loadUnavailableNotified: false,
@@ -152,12 +167,18 @@ function ioSentence(sample: IoPressureSample): string {
 	return `I/O pressure: ${some}% of wall time with at least one task stalled on I/O${full}`;
 }
 
-function formatCombinedReport(
-	changes: Array<{ signal: Signal; previous: Band; next: Band }>,
-	state: State,
-): string {
-	const changed = new Map<Signal, { previous: Band; next: Band }>();
-	for (const change of changes) changed.set(change.signal, change);
+/** The band each signal is in right now. */
+function currentBands(state: State): Bands {
+	return { load: state.loadBand, memory: state.memoryBand, swap: state.swapBand, io: state.ioBand };
+}
+
+function formatCombinedReport(state: State): string {
+	const current = currentBands(state);
+	const changed = (signal: Signal): { previous: Band; next: Band } | undefined => {
+		const previous = state.reported[signal];
+		const next = current[signal];
+		return previous === next ? undefined : { previous, next };
+	};
 
 	// Every signal with a reading gets a line, whether or not it changed, so one
 	// message carries the full picture. A signal without a reading gets no line
@@ -169,7 +190,7 @@ function formatCombinedReport(
 		lines.push(
 			`Load average: ${load.load1.toFixed(2)} (1 min), ${load.load5.toFixed(2)} (5 min), ` +
 				`${load.load15.toFixed(2)} (15 min) on ${state.cpus} logical CPUs` +
-				bandClause(changed.get("load"), state.loadBand),
+				bandClause(changed("load"), state.loadBand),
 		);
 	}
 	if (state.memory?.available) {
@@ -177,14 +198,14 @@ function formatCombinedReport(
 		lines.push(
 			`Memory: ${formatBytes(memory.usedBytes)} of ${formatBytes(memory.totalBytes)} in use ` +
 				`(${(memory.usedFraction * 100).toFixed(0)}%)` +
-				bandClause(changed.get("memory"), state.memoryBand),
+				bandClause(changed("memory"), state.memoryBand),
 		);
 	}
 	if (state.swap?.available) {
-		lines.push(swapSentence(state.swap) + bandClause(changed.get("swap"), state.swapBand));
+		lines.push(swapSentence(state.swap) + bandClause(changed("swap"), state.swapBand));
 	}
 	if (state.io?.available) {
-		lines.push(ioSentence(state.io) + bandClause(changed.get("io"), state.ioBand));
+		lines.push(ioSentence(state.io) + bandClause(changed("io"), state.ioBand));
 	}
 
 	return lines.join("\n");
@@ -254,6 +275,8 @@ export type SteerDeps = {
 	}) => Promise<IoPressureSample>;
 	loadConfigImpl?: typeof loadConfig;
 	cpuCountImpl?: () => number;
+	/** Injected for tests. Defaults to Date.now. */
+	nowImpl?: () => number;
 };
 
 export type ResolvedDeps = Required<SteerDeps>;
@@ -266,6 +289,7 @@ function resolveDeps(deps: SteerDeps): ResolvedDeps {
 		readIoPressureImpl: deps.readIoPressureImpl ?? readIoPressure,
 		loadConfigImpl: deps.loadConfigImpl ?? loadConfig,
 		cpuCountImpl: deps.cpuCountImpl ?? cpuCount,
+		nowImpl: deps.nowImpl ?? Date.now,
 	};
 }
 
@@ -288,7 +312,7 @@ async function sampleAndReport(
 	// A rate needs two readings, so the reader is handed the previous sample
 	// and the wall time since it. macOS gets its disk figure this way; the
 	// other platforms ignore both.
-	const now = Date.now();
+	const now = deps.nowImpl();
 	const elapsedMs = state.lastSampleAt === null ? 0 : now - state.lastSampleAt;
 	state.lastSampleAt = now;
 
@@ -328,54 +352,43 @@ async function sampleAndReport(
 
 	updateStatus(ctx, state);
 
-	if (!config.enabled) return null;
-
-	const changes: Array<{ signal: Signal; previous: Band; next: Band }> = [];
-
-	if (load.available) {
-		const previous = state.loadBand;
-		const next = nextBand(previous, load.load1, config.loadThreshold, config);
-		if (isCrossing(previous, next)) {
-			changes.push({ signal: "load", previous, next });
-			state.loadBand = next;
-		}
-	}
-
+	if (load.available) state.loadBand = nextBand(state.loadBand, load.load1, config.loadThreshold, config);
 	if (memory.available) {
-		const previous = state.memoryBand;
-		const next = nextBand(previous, memory.usedFraction, config.memoryThreshold, config);
-		if (isCrossing(previous, next)) {
-			changes.push({ signal: "memory", previous, next });
-			state.memoryBand = next;
-		}
+		state.memoryBand = nextBand(state.memoryBand, memory.usedFraction, config.memoryThreshold, config);
+	}
+	if (swap.available) state.swapBand = nextBand(state.swapBand, swap.usedFraction, config.swapThreshold, config);
+	if (io.available) state.ioBand = nextBand(state.ioBand, io.some10, config.ioThreshold, config);
+
+	const current = currentBands(state);
+
+	// A disabled extension keeps this bookkeeping current so that turning it on
+	// mid-session reports the machine as it is, not a backlog of transitions.
+	if (!config.enabled) {
+		state.reported = current;
+		state.lastReportAt = now;
+		return null;
 	}
 
-	if (swap.available) {
-		const previous = state.swapBand;
-		const next = nextBand(previous, swap.usedFraction, config.swapThreshold, config);
-		if (isCrossing(previous, next)) {
-			changes.push({ signal: "swap", previous, next });
-			state.swapBand = next;
-		}
-	}
+	const pending = SIGNALS.filter((signal) => current[signal] !== state.reported[signal]);
+	if (pending.length === 0) return null;
 
-	if (io.available) {
-		const previous = state.ioBand;
-		const next = nextBand(previous, io.some10, config.ioThreshold, config);
-		if (isCrossing(previous, next)) {
-			changes.push({ signal: "io", previous, next });
-			state.ioBand = next;
-		}
-	}
+	// A machine under load crosses a band boundary every few seconds, and a
+	// band that steps down and back up is the same state it started in. Sending
+	// a message per crossing buries the conversation it was meant to accompany,
+	// so a message is sent at most once per interval and measures each signal
+	// against the band its reader was last told: what left and came back
+	// reports nothing, and what moved twice reports one net change.
+	if (state.lastReportAt !== null && now - state.lastReportAt < config.minReportIntervalMs) return null;
 
-	if (changes.length === 0) return null;
-
+	const report = formatCombinedReport(state);
 	if (debugEnabled()) {
-		for (const change of changes) {
-			console.error(`[load-aware-steer] ${change.signal} ${change.previous} -> ${change.next}`);
+		for (const signal of pending) {
+			console.error(`[load-aware-steer] ${signal} ${state.reported[signal]} -> ${current[signal]}`);
 		}
 	}
-	return formatCombinedReport(changes, state);
+	state.reported = current;
+	state.lastReportAt = now;
+	return report;
 }
 
 async function beforeAgentStart(
@@ -444,6 +457,8 @@ export default function loadAwareSteer(pi: ExtensionAPI, deps: SteerDeps = {}): 
 		state.memoryBand = "normal";
 		state.swapBand = "normal";
 		state.ioBand = "normal";
+		state.reported = currentBands(state);
+		state.lastReportAt = null;
 		state.loadUnavailableNotified = false;
 		state.memoryUnavailableNotified = false;
 		state.swapUnavailableNotified = false;
@@ -479,6 +494,8 @@ export default function loadAwareSteer(pi: ExtensionAPI, deps: SteerDeps = {}): 
 		state.memoryBand = "normal";
 		state.swapBand = "normal";
 		state.ioBand = "normal";
+		state.reported = currentBands(state);
+		state.lastReportAt = null;
 		state.io = null;
 		state.lastSampleAt = null;
 	});

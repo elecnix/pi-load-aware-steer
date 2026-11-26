@@ -129,6 +129,7 @@ function testConfig(overrides: Partial<SteerConfig> = {}): SteerConfig {
 		elevatedMultiplier: 1,
 		highMultiplier: 1.5,
 		hysteresis: 0.1,
+		minReportIntervalMs: 0,
 		...overrides,
 	};
 }
@@ -159,6 +160,7 @@ function makeHarness(config: SteerConfig) {
 		ioWarming: false,
 		ioMeasure: "stall" as IoMeasure,
 		hasUI: true,
+		now: 1_000_000,
 	};
 	const calls = {
 		load: 0,
@@ -192,6 +194,7 @@ function makeHarness(config: SteerConfig) {
 		},
 		loadConfigImpl: async () => config,
 		cpuCountImpl: () => 10,
+		nowImpl: () => box.now,
 	};
 
 	const pi = {
@@ -933,5 +936,65 @@ test("a second session in one process does not inherit the first one's I/O basel
 	const firstOfSecondSession = h.calls.ioArgs.at(-1);
 	assert.equal(firstOfSecondSession?.previous, null, "a new session must not difference against a closed one");
 	assert.equal(firstOfSecondSession?.elapsedMs, 0, "and must not carry the idle gap between them");
+	await h.stop();
+});
+
+test("crossings inside the minimum interval wait and arrive as one net change", async () => {
+	const h = makeHarness(testConfig({ minReportIntervalMs: 300_000 }));
+	await h.start();
+
+	// The first crossing of a session is reported at once.
+	h.box.load1 = 7;
+	assert.match((await h.prompt())?.message?.content ?? "", /Band normal -> high\./);
+
+	// A recovery a second later steps the band down, but no message arrives
+	// inside the interval, at a prompt or at a turn end.
+	h.box.now += 1000;
+	h.box.load1 = 1;
+	assert.equal(appended(await h.turnEnd()).length, 0);
+	h.box.now += 1000;
+	assert.equal(appended(await h.turnEnd()).length, 0);
+	h.box.now += 1000;
+	h.box.io = 0.5;
+	assert.equal((await h.prompt())?.message, undefined);
+
+	// Once the interval has passed, one message names each net change since the
+	// last message: high to normal for load, normal to high for I/O.
+	h.box.now += 300_000;
+	const [draft] = appended(await h.turnEnd());
+	assert.ok(draft, "the pending changes are reported after the interval");
+	assert.match(draft.content ?? "", /Load average: [^\n]*Band high -> normal\./);
+	assert.match(draft.content ?? "", /I\/O pressure: [^\n]*Band normal -> high\./);
+	await h.stop();
+});
+
+test("a band that flaps and returns inside the interval produces no message", async () => {
+	const h = makeHarness(testConfig({ minReportIntervalMs: 300_000 }));
+	await h.start();
+	h.box.ioMeasure = "device-busy";
+	h.box.io = 0.25;
+	assert.ok((await h.prompt())?.message, "the first crossing is reported");
+
+	for (const share of [0.05, 0.4, 0.05, 0.25]) {
+		h.box.now += 2000;
+		h.box.io = share;
+		await h.turnEnd();
+	}
+	// Back in elevated, the band last reported. Nothing changed on net.
+	h.box.now += 300_000;
+	assert.equal(appended(await h.turnEnd()).length, 0);
+	await h.stop();
+});
+
+test("a new session reports its first crossing at once", async () => {
+	const h = makeHarness(testConfig({ minReportIntervalMs: 300_000 }));
+	await h.start();
+	h.box.load1 = 7;
+	assert.ok((await h.prompt())?.message);
+	await h.stop();
+
+	await h.start();
+	h.box.now += 1000;
+	assert.ok((await h.prompt())?.message, "the interval belongs to one session");
 	await h.stop();
 });

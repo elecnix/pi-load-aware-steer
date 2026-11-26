@@ -2,11 +2,13 @@
 
 A pi extension that puts machine load, memory usage, swap usage and disk I/O pressure into the conversation when any one of them changes band.
 
-The extension samples four numbers at two turn boundaries and nowhere else: when a user prompt starts an agent run (`before_agent_start`) and when a turn that ran tools ends (`turn_end`). The watched values are the 1-minute load average, the share of installed RAM in use, the share of swap in use, and the share of wall time the kernel records as stalled on disk I/O. When any value crosses a configured threshold, or falls back below it, the extension injects one message into the conversation with the current figures. Each message reports the 1, 5, and 15-minute load averages, the number of logical CPUs, memory used out of total, swap used out of total, and the I/O stall shares.
+The extension samples four numbers at two turn boundaries and nowhere else: when a user prompt starts an agent run (`before_agent_start`) and when a turn that ran tools ends (`turn_end`). The watched values are the 1-minute load average, the share of installed RAM in use, the share of swap in use, and the share of wall time the kernel records as stalled on disk I/O. When any value crosses a configured threshold, or falls back below it, the extension injects one message into the conversation with the current figures. At most one message is sent every five minutes by default, so a machine that crosses a boundary and comes back inside that window sends nothing, and one that moves twice sends a single message naming the net change. Each message reports the 1, 5, and 15-minute load averages, the number of logical CPUs, memory used out of total, swap used out of total, and the I/O stall shares.
 
 The measures are chosen to show pressure rather than activity. Memory follows the kernel's own accounting of memory in use, not a naive total-minus-free. Disk I/O pressure is the kernel's PSI stall accounting (`/proc/pressure/io`), the share of wall time tasks spent waiting on I/O, rather than a throughput, `%util` or `iowait` figure that can move without anything waiting.
 
 All four signals are sampled together, and a sample that crosses several thresholds produces one combined message, not one message per signal. A signal that did not cross appears in that message with its current band.
+
+Samples arrive one or two seconds apart, because a turn that ran tools ends about that often. On macOS that is too short a window to measure a disk busy share over: one burst of writes over one second reads as near saturation and the next second reads as idle, which is how a single report becomes twelve in three minutes. So the macOS figure averages over at least ten seconds, the same window Linux's `avg10` covers, and carries its last figure forward while the next window fills.
 
 There is no timer. While the agent sits idle between prompts, nothing is sampled and nothing accumulates; a crossing at one prompt is not repeated at the next.
 
@@ -59,7 +61,7 @@ The package is marked `private` in `package.json` so it cannot be published to n
 
 Each signal has three bands: `normal`, `elevated`, and `high`. The thresholds are the signal's own threshold multiplied by 1.0 and 1.5, and each band releases at 10% below its entry point. That margin is what keeps a value sitting on a boundary from producing a message at every sample.
 
-An upward crossing moves straight to the band the sample justifies. A downward crossing steps down one band at a time, so a machine recovering passes through `high`, then `elevated`, then `normal`, with a message at each step.
+An upward crossing moves straight to the band the sample justifies. A downward crossing steps down one band at a time, so a machine recovering passes through `high`, then `elevated`, then `normal`. Each step is a band change, but a message is only sent when the minimum interval has passed, and it carries the difference between the current band and the band last reported: a machine that stepped down and back up reports nothing.
 
 If a sensor stops answering, its band is held rather than released. Treating missing data as quiet would manufacture a recovery out of a dead reader.
 
@@ -75,12 +77,13 @@ Settings resolve in the order defaults, then config file, then environment. The 
 | I/O pressure threshold, as a percent of wall time | `LOAD_AWARE_STEER_IO_THRESHOLD` | `ioPressureThresholdPercent` | `20` |
 | Hysteresis as a fraction | `LOAD_AWARE_STEER_HYSTERESIS` | `hysteresis` | `0.1` |
 | Master switch | `LOAD_AWARE_STEER_ENABLED` | `enabled` | `true` |
+| Shortest time between two messages, in seconds | `LOAD_AWARE_STEER_MIN_INTERVAL` | `minReportIntervalSeconds` | `300` |
 | Config file path | `LOAD_AWARE_STEER_CONFIG` | none | `~/.pi/agent/load-aware-steer.json` |
 | Debug logging to stderr | `LOAD_AWARE_STEER_DEBUG=1` | none | unset |
 
 A load threshold equal to the CPU count means the machine has as many runnable threads as it has cores. A memory threshold of 80 means 80% of installed RAM is in use. A swap threshold of 50 means half of the configured swap is committed. An I/O threshold of 20 means tasks were stalled on I/O for 20% of wall time.
 
-With `enabled: false` the extension still samples at the boundaries and still updates the status line, but it appends no messages.
+With `enabled: false` the extension still samples at the boundaries and still updates the status line, but it appends no messages. With `minReportIntervalSeconds: 0` every crossing is reported as soon as it is sampled.
 
 ## Limitations
 
@@ -88,11 +91,11 @@ With `enabled: false` the extension still samples at the boundaries and still up
 - Memory figures follow each platform's own accounting of memory in use, because `os.freemem()` on its own counts reclaimable page cache as in use and reports near-saturation on a machine with a warm cache. On macOS the reader parses `vm_stat` and adds anonymous, wired and compressed pages, which is the total Activity Monitor shows. On Linux it reads `/proc/meminfo` and subtracts `MemAvailable` from `MemTotal`. Everywhere else, and whenever either source fails, it falls back to `os.totalmem() - os.freemem()`. The `source` field on a sample records which path produced the number, and `LOAD_AWARE_STEER_DEBUG=1` logs a fallback to stderr.
 - Swap follows the platform too: `/proc/meminfo` on Linux and `sysctl vm.swapusage` on macOS. A machine with no swap reports `none configured` rather than a percentage of nothing, and a source that cannot be read reports unavailable rather than zero.
 - Swap usage is a fill level, not a rate. It does not fall on its own, so a machine that filled its swap once holds the band while the pages stay there, whether or not it is paging now. The I/O pressure line is the moving figure beside it; swap says how much backing store is committed.
-- I/O is measured differently on each platform, and the message says which. Linux reads PSI, which is the share of wall time a task spent stalled. macOS has no PSI, so there the figure is IOKit's own per-disk busy time, differenced between samples and reported as `Disk busy`, the share of wall time a disk had a request outstanding. The two are not interchangeable: a queueing disk is busy well before anything waits on it. Neither platform ever substitutes throughput, `%util` or `iowait`, because a number for a different question reads as an answer. A Linux kernel built without PSI, or an unreadable `/proc/pressure/io`, is a fault and is reported; a platform that publishes nothing at all is not.
+- I/O is measured differently on each platform, and the message says which. Linux reads PSI, which is the share of wall time a task spent stalled. macOS has no PSI, so there the figure is IOKit's own per-disk busy time, differenced across at least ten seconds of samples and reported as `Disk busy`, the share of wall time a disk had a request outstanding. The two are not interchangeable: a queueing disk is busy well before anything waits on it. Neither platform ever substitutes throughput, `%util` or `iowait`, because a number for a different question reads as an answer. A Linux kernel built without PSI, or an unreadable `/proc/pressure/io`, is a fault and is reported; a platform that publishes nothing at all is not.
 - The footer status line stays muted, and takes the warning colour only when load is above one runnable thread per CPU or swap is past its threshold. It never uses the error colour. Memory never colours it, because a warm page cache is how a working machine looks.
 - A diagnostic reaches a person through the pi UI when one is attached, and through stderr only in a headless run. Writing to the console while pi owns the terminal paints the text over the rendered frame, where it smears the interface and scrolls away, so the extension does not do it.
 - Load average counts runnable and uninterruptible threads, so heavy disk I/O raises it even when the CPUs are idle.
-- A value oscillating across a band boundary produces one message per crossing. Raise `hysteresis` to reduce the rate.
+- A value that stays on the far side of a boundary is reported once per interval, not once per crossing, and a value that returns to the band last reported sends nothing at all. Raise `minReportIntervalSeconds` for fewer messages, or lower it to 0 to see every crossing.
 - `os.loadavg()` is absent on Windows, where it returns zeros. The extension reports the load as unavailable rather than treating a zero reading as an idle machine, and a footer status shows `—` for it.
 
 ## Development
