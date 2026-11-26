@@ -64,10 +64,26 @@ export type IoPressureSample = {
 	detail?: string;
 	/** The quantity `some10` carries, absent when there is no figure. */
 	measure?: IoMeasure;
-	/** Cumulative device busy nanoseconds, the baseline for the next sample's
-	 *  rate. Only macOS carries it, and it is never presented as a figure. */
+	/** Cumulative device busy nanoseconds at which the open rate window began.
+	 *  Only macOS carries it, and it is never presented as a figure. */
 	cumulativeBusyNs?: number;
+	/** Milliseconds the open rate window has accumulated, or 0 when the last
+	 *  sample closed one. Only macOS carries it: the window spans several
+	 *  samples so a rate is an average rather than a single short interval. */
+	windowElapsedMs?: number;
 };
+
+/**
+ * The wall time a macOS disk-busy figure averages over.
+ *
+ * A rate differenced between two samples a second apart swings from a few
+ * percent to half the interval on one burst of writes, because one second is
+ * the whole denominator. PSI smooths the same question with `avg10`, so macOS
+ * averages over the same ten seconds: a figure is published once the open
+ * window reaches this length, and inside the next window the last figure
+ * stands.
+ */
+export const DARWIN_WINDOW_MS = 10_000;
 
 export type IoPressureReaderOptions = {
 	/** Overrides process.platform. Injected for tests. */
@@ -161,8 +177,10 @@ export function parseIokitBusyNs(output: string): number | null {
  * `device-busy` and never confused with a stall: a queueing device is busy
  * before anything waits on it.
  *
- * A rate needs two readings, so the first sample of a session stores its
- * baseline and returns no figure. Every later sample differences against it.
+ * A rate needs two readings, and a figure worth reporting needs a window long
+ * enough to average over, so the first sample of a session stores its baseline
+ * and returns no figure, and samples that arrive before the window is ten
+ * seconds old carry the previous figure while that window fills.
  */
 async function darwinBusy(options: IoPressureReaderOptions): Promise<IoPressureSample> {
 	const run = options.execFileImpl ?? (async (file: string, args: string[]) => {
@@ -194,12 +212,35 @@ async function darwinBusy(options: IoPressureReaderOptions): Promise<IoPressureS
 			source: "iokit-device-busy",
 			measure: "device-busy",
 			cumulativeBusyNs: busyNs,
+			windowElapsedMs: 0,
 			detail: "a second reading is required for a rate",
 		};
 	}
 
-	const elapsedNs = elapsedMs * 1_000_000;
-	const busy = (busyNs - (previous.cumulativeBusyNs as number)) / elapsedNs;
+	// The window opened at the previous sample's baseline. The baseline is only
+	// advanced when the window closes, so a sample taken two seconds in adds to
+	// the window instead of replacing what it already measured.
+	const baseline = previous.cumulativeBusyNs as number;
+	const windowElapsedMs = (previous.windowElapsedMs ?? 0) + elapsedMs;
+
+	if (windowElapsedMs < DARWIN_WINDOW_MS) {
+		// Too short to average over. A window that has already produced a figure
+		// carries it forward; one that has not is still warming.
+		const closed = previous.available;
+		return {
+			available: closed,
+			some10: closed ? previous.some10 : 0,
+			full10: null,
+			source: "iokit-device-busy",
+			measure: "device-busy",
+			cumulativeBusyNs: baseline,
+			windowElapsedMs,
+			detail: closed ? undefined : "the rate window is still filling",
+		};
+	}
+
+	const elapsedNs = windowElapsedMs * 1_000_000;
+	const busy = (busyNs - baseline) / elapsedNs;
 	return {
 		available: true,
 		// Disks can overlap, so the aggregate can exceed the wall interval.
@@ -209,6 +250,7 @@ async function darwinBusy(options: IoPressureReaderOptions): Promise<IoPressureS
 		source: "iokit-device-busy",
 		measure: "device-busy",
 		cumulativeBusyNs: busyNs,
+		windowElapsedMs: 0,
 	};
 }
 

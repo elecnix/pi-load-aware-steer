@@ -115,3 +115,25 @@ test("a non-numeric environment value is ignored, not treated as zero", async ()
 	assert.equal(config.swapThreshold, 0.5);
 	assert.equal(config.swapThresholdSource, "default");
 });
+
+test("the minimum interval between messages defaults to five minutes", async () => {
+	const config = await load({});
+	assert.equal(config.minReportIntervalMs, 300_000);
+	assert.equal(DEFAULTS.minReportIntervalSeconds, 300);
+});
+
+test("the minimum interval comes from the file in seconds, and the environment wins", async () => {
+	assert.equal((await load({}, JSON.stringify({ minReportIntervalSeconds: 60 }))).minReportIntervalMs, 60_000);
+	assert.equal(
+		(await load({ LOAD_AWARE_STEER_MIN_INTERVAL: "0" }, JSON.stringify({ minReportIntervalSeconds: 60 })))
+			.minReportIntervalMs,
+		0,
+		"zero reports every crossing",
+	);
+});
+
+test("a negative minimum interval is replaced by the default with a warning", async () => {
+	const config = await load({ LOAD_AWARE_STEER_MIN_INTERVAL: "-5" });
+	assert.equal(config.minReportIntervalMs, 300_000);
+	assert.ok(config.warnings.some((warning) => /minReportIntervalSeconds/.test(warning)));
+});
